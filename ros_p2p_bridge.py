@@ -57,9 +57,20 @@ class AsyncBridge:
     def __init__(self):
         self.ws = None
         self.loop = asyncio.new_event_loop()
-        self.queue = asyncio.Queue()
+        
+        # We use a dual-dispatch system to prioritize new data
+        self.latest_volatile = {}      # msg_type -> msg (Latest-wins for sensors/video)
+        self.ordered_queue = asyncio.Queue()  # FIFO for logs/terminal
+        self.data_ready = asyncio.Event()     # Signal when any data is available
+        
         self.on_message_callback = None
         self._running = True
+        
+        # Message types that should always use Latest-Wins to prevent "fast-forwarding"
+        self.volatile_types = {
+            'camera_top', 'camera_bottom', 'robot_pose', 'scan_data', 
+            'battery', 'local_costmap', 'global_costmap', 'path_data', 'nav2_status'
+        }
 
     def set_on_message(self, callback):
         self.on_message_callback = callback
@@ -68,13 +79,12 @@ class AsyncBridge:
         while self._running:
             try:
                 print(f">>> [IPC] Connecting to Node Bridge at {NODE_BRIDGE_URL}...")
-                async with websockets.connect(NODE_BRIDGE_URL, max_size=10*1024*1024) as websocket:
+                async with websockets.connect(NODE_BRIDGE_URL, ping_interval=1, ping_timeout=1) as websocket:
                     print(">>> [IPC] Connected to Node Bridge")
                     self.ws = websocket
+                    self.data_ready.set() # Kick-start the loop
                     
-                    # Task for sending messages from the queue
                     send_task = asyncio.create_task(self._send_loop())
-                    # Task for receiving messages
                     recv_task = asyncio.create_task(self._recv_loop())
                     
                     done, pending = await asyncio.wait(
@@ -92,11 +102,27 @@ class AsyncBridge:
 
     async def _send_loop(self):
         while self.ws:
-            msg = await self.queue.get()
-            try:
-                await self.ws.send(msg)
-            except:
-                break
+            # 1. Wait for data
+            await self.data_ready.wait()
+            self.data_ready.clear()
+            
+            # 2. Flush Ordered messages first (logs, terminal)
+            while not self.ordered_queue.empty():
+                try:
+                    msg = self.ordered_queue.get_nowait()
+                    await asyncio.wait_for(self.ws.send(msg), timeout=0.5)
+                except: break
+            
+            # 3. Flush Latest Volatile messages (sensor/camera)
+            # We copy and clear to minimize lock time/races
+            current_volatile = self.latest_volatile.copy()
+            self.latest_volatile.clear()
+            
+            for mtype in self.volatile_types:
+                if mtype in current_volatile:
+                    try:
+                        await asyncio.wait_for(self.ws.send(current_volatile[mtype]), timeout=0.5)
+                    except: break
 
     async def _recv_loop(self):
         while self.ws:
@@ -110,7 +136,13 @@ class AsyncBridge:
     def send(self, type, payload):
         if not self._running: return
         msg = json.dumps({"type": type, **payload})
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, msg)
+        
+        if type in self.volatile_types:
+            self.latest_volatile[type] = msg
+        else:
+            self.loop.call_soon_threadsafe(self.ordered_queue.put_nowait, msg)
+            
+        self.loop.call_soon_threadsafe(self.data_ready.set)
 
     def start(self):
         threading.Thread(target=self._run_loop, daemon=True).start()
@@ -363,7 +395,12 @@ def on_bridge_message(msg):
     global teleop_pub, nav_node, terminal_process
     mtype = msg.get('type')
 
-    if mtype == 'cmd_vel':
+    if mtype == 'emergency_stop':
+        if teleop_pub:
+            pub_twist(0.0, 0.0)
+            print(">>> [SAFETY] EMERGENCY STOP TRIGGERED")
+
+    elif mtype == 'cmd_vel':
         cmd = msg.get('command')
         if cmd and teleop_pub:
             t = Twist()
@@ -428,8 +465,8 @@ def start_ros2():
         executor = MultiThreadedExecutor(num_threads=12)
         nav_node = NavDataSubscriber(tf_buffer)
         nodes = [node, 
-                 ImageSubscriber('web_cam_top_sub', '/robot2/camera_top/camera_top/color/image_raw/compressed', 'camera_top', 6),
-                 ImageSubscriber('web_cam_bottom_sub', '/robot2/camera_bottom/camera_bottom/color/image_raw/compressed', 'camera_bottom', 6),
+                 ImageSubscriber('web_cam_top_sub', '/robot2/camera_top/camera_top/color/image_raw/compressed', 'camera_top', 10),
+                 ImageSubscriber('web_cam_bottom_sub', '/robot2/camera_bottom/camera_bottom/color/image_raw/compressed', 'camera_bottom', 10),
                  BatterySubscriber(), 
                  nav_node, 
                  LogSubscriber()]

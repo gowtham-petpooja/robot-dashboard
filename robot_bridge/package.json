@@ -11,6 +11,7 @@
   "description": "",
   "dependencies": {
     "@roamhq/wrtc": "^0.10.0",
+    "canvas": "^3.2.2",
     "jsdom": "^29.0.1",
     "peerjs": "^1.5.5",
     "ws": "^8.20.0"

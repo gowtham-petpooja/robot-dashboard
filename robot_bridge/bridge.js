@@ -29,7 +29,8 @@ window.WebSocket = WS;
 const RTCPrototypes = [
     { name: 'RTCPeerConnection', val: wrtc.RTCPeerConnection },
     { name: 'RTCSessionDescription', val: wrtc.RTCSessionDescription },
-    { name: 'RTCIceCandidate', val: wrtc.RTCIceCandidate }
+    { name: 'RTCIceCandidate', val: wrtc.RTCIceCandidate },
+    { name: 'MediaStream', val: wrtc.MediaStream }
 ];
 
 RTCPrototypes.forEach(({ name, val }) => {
@@ -45,14 +46,104 @@ wrtc.RTCPeerConnection.prototype.sctp = null;
 
 const { Peer } = require('peerjs');
 const WebSocket = require('ws');
+const { createCanvas, Image } = require('canvas');
 
 // --- Configuration ---
 const ROBOT_PEER_ID = process.env.ROBOT_ID || 'robot-petpooja-1';
 const IPC_PORT = process.env.IPC_PORT || 8765;
 
 // --- State ---
-const browserConns = new Set(); // Support multiple concurrent dashboards
-let pythonWs = null;   // The WebSocket connection to the ROS2 node
+let browserConn = null; // DataChannel connection
+let activeCall = null;   // MediaStream call
+let pythonWs = null;    // Internal ROS2 link
+
+// ── WebRTC Media Source ───
+// We create virtual video sources that we'll feed with decoded JPEGs
+const topVideoSource = new wrtc.nonstandard.RTCVideoSource();
+const topTrack = topVideoSource.createTrack();
+const bottomVideoSource = new wrtc.nonstandard.RTCVideoSource();
+const bottomTrack = bottomVideoSource.createTrack();
+
+const stream = new MediaStream([topTrack, bottomTrack]);
+
+// --- Camera 1 (TOP) Resources ---
+const topCanvas = createCanvas(640, 480);
+const topCtx = topCanvas.getContext('2d');
+const topImg = new Image();
+
+// --- Camera 2 (BOTTOM) Resources ---
+const bottomCanvas = createCanvas(640, 480);
+const bottomCtx = bottomCanvas.getContext('2d');
+const bottomImg = new Image();
+
+// ── Optimized Pixel Format Conversion ───
+// Subsamples by 2 in both directions to save 75% CPU time.
+// This scales $640 \times 480$ RGBA down to $320 \times 240$ I420.
+function rgbaToI420(rgba, width, height) {
+    const sw = width >> 1;  // subsampled width
+    const sh = height >> 1; // subsampled height
+    const ySize = sw * sh;
+    const uvSize = ySize / 4;
+    const i420 = new Uint8ClampedArray(ySize + 2 * uvSize);
+
+    let yIdx = 0;
+    let uIdx = ySize;
+    let vIdx = ySize + uvSize;
+
+    // We only iterate every 2nd pixel to save massive CPU
+    for (let j = 0; j < height; j += 2) {
+        for (let i = 0; i < width; i += 2) {
+            const pixelIdx = (j * width + i) * 4;
+            const r = rgba[pixelIdx];
+            const g = rgba[pixelIdx + 1];
+            const b = rgba[pixelIdx + 2];
+
+            // Y component
+            i420[yIdx++] = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+
+            // U and V (further subsampled)
+            if (j % 4 === 0 && i % 4 === 0) {
+                i420[uIdx++] = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                i420[vIdx++] = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+            }
+        }
+    }
+    return { data: i420, width: sw, height: sh };
+}
+
+let lastFrameLog = 0;
+function pushFrameToSource(source, base64Data, canvas, ctx, img) {
+    // GATE: Only decode if there is an active call
+    if (!activeCall) return;
+
+    img.onload = () => {
+        const start = Date.now();
+        if (canvas.width !== img.width || canvas.height !== img.height) {
+            canvas.width = img.width;
+            canvas.height = img.height;
+        }
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        
+        // Convert RGBA -> I420 for WebRTC compatibility (Downsampled for speed)
+        const res = rgbaToI420(imageData.data, canvas.width, canvas.height);
+        
+        source.onFrame({
+            width: res.width,
+            height: res.height,
+            data: res.data
+        });
+        
+        const end = Date.now();
+        const now = Date.now();
+        if (now - lastFrameLog > 5000) {
+            console.log(`>>> [PEER] Frame Pushed. Conv Time: ${end - start}ms | Res: ${res.width}x${res.height}`);
+            lastFrameLog = now;
+        }
+    };
+    img.onerror = (err) => console.error('>>> [PEER] Image Decode Error:', err);
+    img.src = 'data:image/jpeg;base64,' + base64Data;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // PEERJS SETUP (P2P Link)
@@ -64,10 +155,9 @@ const peer = new Peer(ROBOT_PEER_ID, {
     path: '/',
     debug: 2,
     config: {
-        'iceServers': [
+        iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:stun2.l.google.com:19302' }
+            { urls: 'stun:stun1.l.google.com:19302' }
         ]
     }
 });
@@ -77,18 +167,23 @@ peer.on('open', (id) => {
 });
 
 peer.on('connection', (conn) => {
-    console.log(`>>> [PEER] Incoming connection request from ${conn.peer}`);
+    console.log(`>>> [PEER] Incoming connection request: ${conn.peer}`);
     
-    conn.on('open', () => {
-        console.log(`>>> [PEER] DASHBOARD_LINK established: ${conn.peer}`);
-        browserConns.add(conn);
-        
-        // Request full initial state for the new connection only after it is open
-        if (pythonWs && pythonWs.readyState === WebSocket.OPEN) {
-            console.log('>>> [BRIDGE] Requesting initial state for new client...');
-            pythonWs.send(JSON.stringify({ type: 'request_map' }));
-        }
-    });
+    // Graceful handover
+    if (browserConn) {
+        console.log('>>> [PEER] Replacing existing connection and call...');
+        if (activeCall) { try { activeCall.close(); } catch(e) {} }
+        const old = browserConn;
+        browserConn = null;
+        try { old.close(); } catch(e) {}
+    }
+    
+    browserConn = conn;
+    console.log(`>>> [PEER] Connected to: ${conn.peer}`);
+
+    // Initiate the MediaStream call automatically
+    console.log(`>>> [PEER] Initiating MediaStream call to: ${conn.peer}`);
+    activeCall = peer.call(conn.peer, stream);
 
     conn.on('data', (raw) => {
         try {
@@ -98,24 +193,20 @@ peer.on('connection', (conn) => {
                 return;
             }
 
-            // Relay commands from ANY connected dashboard to Python
             if (pythonWs && pythonWs.readyState === WebSocket.OPEN) {
                 pythonWs.send(raw);
             }
         } catch (e) { }
     });
 
-    const cleanup = () => {
-        if (browserConns.has(conn)) {
-            console.log(`>>> [PEER] Connection removed: ${conn.peer}`);
-            browserConns.delete(conn);
-        }
-    };
+    conn.on('close', () => {
+        console.log(`>>> [PEER] Connection closed: ${conn.peer}`);
+        if (activeCall) { try { activeCall.close(); } catch(e) {} activeCall = null; }
+        if (browserConn === conn) browserConn = null;
+    });
 
-    conn.on('close', cleanup);
     conn.on('error', (err) => {
         console.error('>>> [PEER] Connection Error:', err.message);
-        cleanup();
     });
 });
 
@@ -130,10 +221,7 @@ peer.on('error', (err) => {
 // ═══════════════════════════════════════════════════════════════
 // WEBSOCKET IPC SETUP (Local Link to Python)
 // ═══════════════════════════════════════════════════════════════
-const wss = new WebSocket.Server({ 
-    port: IPC_PORT,
-    maxPayload: 10 * 1024 * 1024 // 10MB
-});
+const wss = new WebSocket.Server({ port: IPC_PORT });
 console.log(`>>> [IPC] Internal Server Listening: ${IPC_PORT}`);
 
 wss.on('connection', (ws) => {
@@ -141,19 +229,41 @@ wss.on('connection', (ws) => {
     pythonWs = ws;
 
     ws.on('message', (message) => {
-        // Broadcast telemetry to ALL connected dashboards
-        const rawMsg = message.toString();
-        browserConns.forEach(conn => {
-            if (conn.open) {
-                try {
-                    conn.send(rawMsg);
-                } catch(e) {
-                    browserConns.delete(conn);
+        const raw = message.toString();
+
+        // 1. MediaStream Relay (High performance)
+        if (raw.includes('"camera_top"')) {
+            try {
+                const msg = JSON.parse(raw);
+                if (!msg.data) { console.warn('>>> [IPC] empty camera_top data'); return; }
+                pushFrameToSource(topVideoSource, msg.data, topCanvas, topCtx, topImg);
+            } catch(e) { console.error('>>> [IPC] camera_top decode fail:', e.message); }
+        } else if (raw.includes('"camera_bottom"')) {
+            try {
+                const msg = JSON.parse(raw);
+                if (!msg.data) { console.warn('>>> [IPC] empty camera_bottom data'); return; }
+                pushFrameToSource(bottomVideoSource, msg.data, bottomCanvas, bottomCtx, bottomImg);
+            } catch(e) { console.error('>>> [IPC] camera_bottom decode fail:', e.message); }
+        } else if (raw.includes('"battery"') || raw.includes('"robot_pose"')) {
+            // Log telemetry presence occasionally
+            if (Math.random() < 0.05) console.log('>>> [IPC] Telemetry relaying...');
+        }
+
+        // 2. DataChannel Relay (Backup & Telemetry)
+        if (browserConn && browserConn.open) {
+            const dc = browserConn.dataChannel;
+            // Only send if the raw DataChannel is actually in the 'open' state
+            if (!dc || dc.readyState !== 'open') return;
+
+            if (dc.bufferedAmount > 256 * 1024) {
+                if (raw.includes('"camera_top"') || raw.includes('"camera_bottom"') || raw.includes('"robot_pose"')) {
+                    return; 
                 }
-            } else {
-                browserConns.delete(conn);
             }
-        });
+            try {
+                browserConn.send(raw);
+            } catch(e) { }
+        }
     });
 
     ws.on('close', () => {
@@ -171,7 +281,8 @@ wss.on('connection', (ws) => {
 // ═══════════════════════════════════════════════════════════════
 process.on('SIGINT', () => {
     console.log('>>> [BRIDGE] Shutting down...');
-    browserConns.forEach(c => c.close());
+    if (activeCall) activeCall.close();
+    if (browserConn) browserConn.close();
     peer.destroy();
     process.exit();
 });
