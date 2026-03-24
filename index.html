@@ -112,18 +112,23 @@
                 });
 
                 this.peer.on('disconnected', () => {
-                    const btn = document.getElementById('btn-connect');
-                    if (btn) {
-                        btn.classList.remove('is-loading');
-                        btn.innerText = 'ESTABLISH LINK';
-                    }
                     showNotification('>>> PEER_SERVER: DISCONNECTED — reconn...', '#ffaa00');
                     if (!this.peer.destroyed) this.peer.reconnect();
                 });
+
+                // --- Network Resilience (Router switches, interface changes) ---
+                if (navigator.connection) {
+                    navigator.connection.onchange = () => {
+                        console.warn('>>> [BROWSER] Network Change Detected! Triggering recovery...');
+                        showNotification('>>> NETWORK_SWITCH: REBOOTING_LINK...', '#ffaa00');
+                        this.reconnect();
+                    };
+                }
             }
 
             reconnect() {
                 console.warn('>>> [PEER] Aggressive RECONNECT triggered!');
+                document.body.classList.add('reconnecting');
                 this._stopHeartbeat();
                 if (this.conn) { try { this.conn.close(); } catch(_) {} this.conn = null; }
                 if (this.peer && !this.peer.destroyed) {
@@ -536,28 +541,32 @@
             // WATCHDOG
             setInterval(() => {
                 const idle = Date.now() - lastMsgTime;
+                
+                // If we are currently trying to connect, don't trigger another recovery
+                if (document.body.classList.contains('reconnecting')) return;
+
                 if (!link.conn || !link.conn.open) {
-                    if (idle > 10000 && !document.body.classList.contains('reconnecting')) {
-                        console.warn('>>> [WATCHDOG] Link seems stuck half-open. Reconnecting...');
-                        document.body.classList.add('reconnecting');
+                    if (idle > 15000) {
+                        console.warn('>>> [WATCHDOG] Initial connection stall. Reconnecting...');
                         link.reconnect();
                     }
                     return;
                 }
                 
-                // Aggressive lag indicator (Yellow at 1.5s, Red at 3s)
+                // Aggressive lag indicator
                 const latEl = document.getElementById('sync-latency');
                 if (idle > 3000) {
                     latEl.innerText = `>>> STALE: ${(idle/1000).toFixed(1)}s`;
                     latEl.style.color = '#ff0000';
-                } else if (idle > 1500) {
+                } else if (idle > 1000) {
                     latEl.innerText = `>>> LAG: ${(idle/1000).toFixed(1)}s`;
                     latEl.style.color = '#ffaa00';
                 }
 
-                if (idle > 5000) {
+                // Only perform forced recovery if we haven't seen data for 15 seconds
+                if (idle > 15000) {
                     console.warn(`>>> [WATCHDOG] Link timeout (${idle}ms). Forced recovery...`);
-                    showNotification('>>> LINK_STALE: RECONNECTING...', '#ff0000');
+                    showNotification('>>> LINK_STALE: RECOVERING...', '#ff0000');
                     link.reconnect();
                 }
             }, 1000);
@@ -680,10 +689,11 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 15px 40px;
+            padding: 10px 40px;
             background: rgba(0, 0, 0, 0.98);
             border-bottom: 2px solid #333;
             z-index: 5000;
+            gap: 20px;
         }
 
         .emergency-stop-btn {
@@ -718,7 +728,8 @@
         .branding {
             display: flex;
             align-items: center;
-            gap: 20px;
+            gap: 15px;
+            flex-shrink: 0;
         }
 
         .logo-img {
@@ -816,6 +827,24 @@
             align-items: center;
             gap: 15px;
             position: relative;
+        }
+
+        .disconnect-btn {
+            background: transparent;
+            border: 1px solid #ff0044;
+            color: #ff0044;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.7em;
+            padding: 6px 14px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .disconnect-btn:hover {
+            background: rgba(255, 0, 68, 0.1);
+            box-shadow: 0 0 10px rgba(255, 0, 68, 0.3);
         }
 
         .batt-label {
@@ -1552,12 +1581,6 @@
             <div class="co-hint">Enter the Peer ID configured on your robot's Node.js bridge</div>
         </div>
     </div>
-    <!-- ═══ DISCONNECT BUTTON (top-bar, always available) ════════════ -->
-    <button id="btn-disconnect" title="Disconnect from robot" style="display:none; position:fixed; top:12px; right:12px; z-index:9999;
-                   background:transparent; border:1px solid #ff0044; color:#ff0044;
-                   font-family:'Fira Code'; font-size:0.65em; padding:4px 12px; cursor:pointer;">
-        DISCONNECT
-    </button>
     <div class="top-bar">
         <div class="branding">
             <img src="/static/petpooja_logo.png" class="logo-img">
@@ -1566,26 +1589,27 @@
                 <span id="nav2-status-badge" class="nav2-badge">Nav2 Health: INIT...</span>
             </span>
             <button id="btn-emergency" class="emergency-stop-btn highlight-pulse">EMERGENCY STOP</button>
-            <div class="sync-monitor">
-                <div id="sys-clock">00:00:00</div>
-                <div id="sync-indicator" class="sync-pulse" onclick="window.location.reload()" title="Force Reconnect">
-                </div>
-                <div id="sync-latency" onclick="window.location.reload()" style="cursor:pointer"
-                    title="Force Reconnect">SYNC: INIT</div>
-                <button onclick="window.location.reload()" class="shell-btn"
-                    style="padding:2px 8px; font-size:0.6em; border-color:#00e5ff; color:#00e5ff;">FORCE_REFRESH</button>
-            </div>
         </div>
-        <div class="sys-group">
-            <div class="sys-group" style="gap:10px;">
-                <button id="view-shell-btn" class="nav-btn btn-shell">REMOTE_SHELL</button>
-                <button id="view-logs-btn" class="nav-btn">SYSTEM_LOGS</button>
+
+        <div class="sync-monitor">
+            <div id="sys-clock">00:00:00</div>
+            <div id="sync-indicator" class="sync-pulse" onclick="window.location.reload()" title="Force Reconnect">
+                <span id="sync-latency">SYNC: INIT</span>
             </div>
-            <span class="batt-label">Battery status</span>
+            <button onclick="window.location.reload()" class="shell-btn"
+                style="padding:2px 8px; font-size:0.6em; border-color:#00e5ff; color:#00e5ff;">FORCE_REFRESH</button>
+        </div>
+
+        <div class="sys-group">
+            <button id="view-shell-btn" class="nav-btn btn-shell">REMOTE_SHELL</button>
+            <button id="view-logs-btn" class="nav-btn">SYSTEM_LOGS</button>
+            
             <div id="batt-box" class="energy-box">
                 <div id="batt-fill" class="energy-fill"></div>
             </div>
-            <span id="batt-pct">--%</span>
+            <span id="batt-pct" class="batt-val">--%</span>
+
+            <button id="btn-disconnect" class="disconnect-btn" style="display:none;">DISCONNECT</button>
         </div>
     </div>
 

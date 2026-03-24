@@ -218,6 +218,11 @@ peer.on('error', (err) => {
     }
 });
 
+peer.on('disconnected', () => {
+    console.warn('>>> [PEER] Disconnected from signaling server. Reconnecting...');
+    if (!peer.destroyed) peer.reconnect();
+});
+
 // ═══════════════════════════════════════════════════════════════
 // WEBSOCKET IPC SETUP (Local Link to Python)
 // ═══════════════════════════════════════════════════════════════
