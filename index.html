@@ -10,16 +10,27 @@
         href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700;900&family=Fira+Code:wght@400;600&display=swap"
         rel="stylesheet">
     <script>
+        // ── Global Diagnostics ──
+        window.onerror = function (msg, url, line) {
+            console.error(`>>> [GLOBAL_ERROR] ${msg} at ${line}`);
+            if (typeof showNotification === 'function') {
+                showNotification(`!!! SYSTEM_ERROR: ${msg.split(':')[0]}`, '#ff0000');
+            } else {
+                alert(`GLOBAL_ERROR: ${msg}`);
+            }
+            return false;
+        };
+
         // ═══════════════════════════════════════════════════════════════
         // ROBOT LINK — PeerJS WebRTC data-channel wrapper
         // ═══════════════════════════════════════════════════════════════
         class RobotLink {
             constructor() {
-                this.peer       = null;
-                this.conn       = null;
-                this.robotId    = null;
-                this._hbTimer   = null;
-                this._rttTs     = 0;
+                this.peer = null;
+                this.conn = null;
+                this.robotId = null;
+                this._hbTimer = null;
+                this._rttTs = 0;
             }
 
             connect(robotId) {
@@ -44,7 +55,7 @@
                 this.peer.on('error', (err) => {
                     console.error('>>> [PEER] Error:', err);
                     showNotification(`>>> PEER_ERROR: ${err.type}`, '#ff0000');
-                    if (['peer-unavailable','network','server-error','socket-error'].includes(err.type)) {
+                    if (['peer-unavailable', 'network', 'server-error', 'socket-error'].includes(err.type)) {
                         setTimeout(() => this._openConn(robotId), 3000);
                     }
                 });
@@ -56,7 +67,7 @@
             }
 
             _openConn(robotId) {
-                if (this.conn) { try { this.conn.close(); } catch(_) {} }
+                if (this.conn) { try { this.conn.close(); } catch (_) { } }
                 this.conn = this.peer.connect(robotId, { reliable: true, serialization: 'raw' });
 
                 this.conn.on('open', () => {
@@ -75,7 +86,7 @@
                     try {
                         const msg = JSON.parse(raw);
                         dispatch(msg);
-                    } catch(e) { console.warn('>>> [PEER] bad JSON', e); }
+                    } catch (e) { console.warn('>>> [PEER] bad JSON', e); }
                 });
 
                 this.conn.on('close', () => {
@@ -123,144 +134,346 @@
             }
         }
 
+
+
+
+        // ═══════════════════════════════════════════════════════════════
+        // GLOBAL STATE & HANDLERS
+        // ═══════════════════════════════════════════════════════════════
+        let link;
+        let lastMsgTime = Date.now();
+        let topLastFrame = 0, bottomLastFrame = 0;
+
+
+
+        // --- Navigation State ---
+        let mapImg = new Image(), localCostImg = new Image(), globalCostImg = new Image();
+        let mapData = null, localCostData = null, globalCostData = null;
+        let robotPose = { x: 0, y: 0, yaw: 0 }, pathPoints = [], scanPoints = [];
+        let isModalOpen = false, followRobot = true;
+        let zoom = 1.0, panX = 0, panY = 0, isDragging = false, lastMouseX = 0, lastMouseY = 0;
+        let rZoom = 0.8, rPanX = 0, rPanY = 0, rIsDragging = false, rLastX = 0, rLastY = 0;
+        let currentGoals = [];
+
+        // --- Topic Handlers ---
+        function handleMap(d) { mapData = d; mapImg.src = 'data:image/png;base64,' + d.image; }
+        function handleLocalCostmap(d) { localCostData = d; localCostImg.src = 'data:image/png;base64,' + d.image; renderHud(); }
+        function handleGlobalCostmap(d) { globalCostData = d; globalCostImg.src = 'data:image/png;base64,' + d.image; renderHud(); }
+        function handleScan(d) { scanPoints = d.points; renderHud(); }
+        function handlePath(d) { pathPoints = d.path; renderHud(); }
+
+        function handlePose(d) {
+            robotPose = d;
+            if (d.stamp) {
+                const latency = (Date.now() / 1000 - d.stamp).toFixed(2);
+                const syncIndicator = document.getElementById('sync-indicator');
+                const syncLatency = document.getElementById('sync-latency');
+                if (syncIndicator) {
+                    syncIndicator.style.background = '#00ff44';
+                    setTimeout(() => syncIndicator.style.background = 'transparent', 100);
+                }
+                if (syncLatency) {
+                    syncLatency.textContent = `LAG: ${latency}s`;
+                    syncLatency.style.color = latency > 1.0 ? '#ff0000' : '#00e5ff';
+                }
+            }
+            renderHud();
+        }
+
+        function handleGoals(data) {
+            console.log(">>> [GOAL_SYNC] Received mission goals:", data);
+            currentGoals = data.goals;
+            const container = document.getElementById('goal-list');
+            if (!container) return;
+            container.innerHTML = '';
+            if (currentGoals.length === 0) {
+                container.innerHTML = '<div style="color:#666; padding:10px; font-size:0.8em;">NO_GOALS_LOADED</div>';
+                return;
+            }
+            currentGoals.forEach(goal => {
+                const btn = document.createElement('button');
+                btn.className = 'goal-btn';
+                btn.innerHTML = `<span class="goal-icon">📍</span> ${goal.name}`;
+                btn.onclick = () => {
+                    if (confirm(`INITIATE TRAJECTORY TO [${goal.name}]?`)) {
+                        link.send('send_goal', goal);
+                        showNotification(`>>> MISSION_START: GOAL=[${goal.name}]`, '#00ff44');
+                    }
+                };
+                container.appendChild(btn);
+            });
+        }
+
+        function handleNav2Status(d) {
+            const badge = document.getElementById('nav2-status-badge');
+            if (!badge) return;
+            badge.innerText = `Nav2 Health: ${d.status}`;
+            badge.style.borderColor = d.status === 'OK' ? '#00ff44' : '#ff0000';
+            badge.style.color = d.status === 'OK' ? '#00ff44' : '#ff0000';
+            badge.style.background = d.status === 'OK' ? 'rgba(0, 255, 68, 0.08)' : 'rgba(255, 0, 0, 0.1)';
+        }
+
+        function handleRosLog(d) {
+            const p = document.getElementById('log-terminal');
+            if (!p) return;
+            const colors = { 'INFO': '#00ff44', 'WARN': '#ffaa00', 'ERROR': '#ff0000', 'FATAL': '#ff00cc' };
+            logEntry(p, `[${d.name}] ${d.msg}`, colors[d.level] || '#fff');
+        }
+
+        function handleTerminalOutput(d) {
+            const p = document.getElementById('shell-output');
+            if (!p) return;
+            const l = document.createElement('div');
+            l.textContent = d.data;
+            p.appendChild(l);
+            p.scrollTop = p.scrollHeight;
+        }
+
+        function handlePong(d) {
+            const rtt = Date.now() - (d.ts || link._rttTs);
+            const syncLatency = document.getElementById('sync-latency');
+            if (syncLatency) {
+                syncLatency.textContent = `RTT: ${rtt}ms`;
+                syncLatency.style.color = rtt > 500 ? '#ff0000' : rtt > 200 ? '#ffaa00' : '#00e5ff';
+            }
+            const syncIndicator = document.getElementById('sync-indicator');
+            if (syncIndicator) {
+                syncIndicator.style.background = '#00ff44';
+                setTimeout(() => syncIndicator.style.background = 'transparent', 100);
+            }
+        }
+
+        function handleBattery(d) {
+            const pct = d.percentage, charging = d.charging, unplug = d.unplug_required;
+            const bBox = document.getElementById('batt-box'), bFill = document.getElementById('batt-fill'),
+                bPct = document.getElementById('batt-pct'), cMsg = document.getElementById('charge-msg');
+            const hPctText = document.getElementById('hud-batt-pct');
+            if (!bBox) return;
+            bPct.textContent = pct + '%'; bFill.style.width = pct + '%'; hPctText.textContent = pct + '%';
+            if (charging) {
+                bFill.style.background = '#00ffcc'; bPct.style.color = '#00ffcc';
+                bBox.classList.add('pulse-charging'); bBox.classList.remove('pulse-low');
+                cMsg.style.opacity = '1'; cMsg.textContent = unplug ? '!!! PLEASE UNPLUG CHARGER !!!' : 'ROBOT IS PLUGGED IN';
+                if (unplug) cMsg.classList.add('urgent-blink'); else cMsg.classList.remove('urgent-blink');
+            } else {
+                bBox.classList.remove('pulse-charging'); cMsg.classList.remove('urgent-blink');
+                if (pct < 50) {
+                    bFill.style.background = '#ff0000'; bPct.style.color = '#ff4444'; cMsg.style.opacity = '1';
+                    if (pct < 30) { bBox.classList.add('pulse-low'); cMsg.textContent = '>>> CHARGE_NOW_CRITICAL'; }
+                    else { bBox.classList.remove('pulse-low'); cMsg.textContent = '>>> PLUG_IN_POWER'; }
+                } else {
+                    bFill.style.background = '#00ff44'; bPct.style.color = '#00ff00';
+                    bBox.classList.remove('pulse-low'); cMsg.style.opacity = '0';
+                }
+            }
+        }
+
+        // --- Render Hud & Draw ---
+        function renderHud() {
+            try {
+                const radarCanvas = document.getElementById('radar-canvas'), modalCanvas = document.getElementById('modal-canvas');
+                if (!radarCanvas) return;
+                const rctx = radarCanvas.getContext('2d'), mctx = modalCanvas.getContext('2d');
+                draw(radarCanvas, rctx, { zoom: rZoom, panX: rPanX, panY: rPanY, follow: true });
+                if (isModalOpen) draw(modalCanvas, mctx, { zoom: zoom, panX: panX, panY: panY, follow: followRobot });
+            } catch (e) { console.error(">>> [RENDER_HUD_ERROR]", e); }
+        }
+
+        function draw(target, tctx, view) {
+            const cw = target.width, ch = target.height;
+            tctx.clearRect(0, 0, cw, ch);
+            if (!mapData) {
+                tctx.fillStyle = "#050a15"; tctx.fillRect(0, 0, cw, ch);
+                tctx.fillStyle = "#00e5ff"; tctx.font = "bold 13px Fira Code"; tctx.textAlign = "center";
+                tctx.fillText("ESTABLISHING_LINK...", cw / 2, ch / 2);
+                return;
+            }
+            const res = mapData.resolution || 0.05;
+            const mapMaxY = mapData.origin_y + mapData.height * res;
+            const toPix = (wx, wy) => ({ x: (wx - mapData.origin_x) / res, y: (mapMaxY - wy) / res });
+            const rPix = toPix(robotPose.x, robotPose.y);
+            tctx.save();
+            try {
+                tctx.translate(cw / 2 + view.panX, ch / 2 + view.panY);
+                tctx.scale(view.zoom, view.zoom);
+                if (view.follow) tctx.rotate(robotPose.yaw - Math.PI / 2);
+                tctx.translate(-rPix.x, -rPix.y);
+                tctx.beginPath(); tctx.strokeStyle = "rgba(0, 229, 255, 0.12)"; tctx.lineWidth = 1;
+                for (let x = -100; x <= 100; x += 10) { const p1 = toPix(x, -100), p2 = toPix(x, 100); tctx.moveTo(p1.x, p1.y); tctx.lineTo(p2.x, p2.y); }
+                for (let y = -100; y <= 100; y += 10) { const p1 = toPix(-100, y), p2 = toPix(100, y); tctx.moveTo(p1.x, p1.y); tctx.lineTo(p2.x, p2.y); }
+                tctx.stroke();
+                if (mapImg.complete) { tctx.save(); tctx.globalAlpha = 0.85; tctx.drawImage(mapImg, 0, 0); tctx.restore(); }
+                const drawCost = (d, img, alpha) => {
+                    if (d && img.complete) {
+                        try {
+                            const dr = d.resolution || 0.05;
+                            const cPix = toPix(d.origin_x, d.origin_y + d.height * dr);
+                            const dw = (d.width * dr) / res, dh = (d.height * dr) / res;
+                            tctx.save(); tctx.globalAlpha = alpha;
+                            if (d.yaw && Math.abs(d.yaw) > 0.001) {
+                                const cOriginPix = toPix(d.origin_x, d.origin_y);
+                                tctx.translate(cOriginPix.x, cOriginPix.y); tctx.rotate(-d.yaw); tctx.translate(-cOriginPix.x, -cOriginPix.y);
+                            }
+                            tctx.drawImage(img, cPix.x, cPix.y, dw, dh);
+                            tctx.restore();
+                        } catch (e) { }
+                    }
+                };
+                drawCost(globalCostData, globalCostImg, 0.4);
+                drawCost(localCostData, localCostImg, 0.6);
+                if (pathPoints.length > 2) {
+                    tctx.beginPath(); tctx.strokeStyle = "rgba(0, 255, 255, 1.0)"; tctx.lineWidth = 4 / view.zoom;
+                    const s = toPix(pathPoints[0].x, pathPoints[0].y); tctx.moveTo(s.x, s.y);
+                    pathPoints.forEach(p => { const pix = toPix(p.x, p.y); tctx.lineTo(pix.x, pix.y); });
+                    tctx.stroke();
+                }
+                if (scanPoints.length > 0) {
+                    tctx.fillStyle = "#ff2200";
+                    const cY = Math.cos(robotPose.yaw), sY = Math.sin(robotPose.yaw);
+                    scanPoints.forEach(p => {
+                        const wx = robotPose.x + p.x * cY - p.y * sY;
+                        const wy = robotPose.y + p.x * sY + p.y * cY;
+                        const pix = toPix(wx, wy);
+                        tctx.beginPath(); tctx.arc(pix.x, pix.y, 3 / view.zoom, 0, Math.PI * 2); tctx.fill();
+                    });
+                }
+            } finally { tctx.restore(); }
+            tctx.save();
+            tctx.translate(cw / 2 + view.panX, ch / 2 + view.panY);
+            tctx.scale(view.zoom, view.zoom);
+            if (!view.follow) tctx.rotate(-robotPose.yaw + Math.PI / 2);
+            tctx.beginPath();
+            tctx.moveTo(0, -20); tctx.lineTo(-14, 12); tctx.lineTo(0, 6); tctx.lineTo(14, 12);
+            tctx.closePath();
+            tctx.fillStyle = "#fff"; tctx.strokeStyle = "#000"; tctx.lineWidth = 2;
+            tctx.fill(); tctx.stroke();
+            tctx.restore();
+        }
+
+        // --- Camera Handling ---
+        let topFramePending = null;
+        let bottomFramePending = null;
+        function handleCameraTop(data) { topFramePending = data; topLastFrame = Date.now(); }
+        function handleCameraBottom(data) { bottomFramePending = data; bottomLastFrame = Date.now(); }
+
+        // --- Dispatcher ---
+        function dispatch(msg) {
+            switch (msg.type) {
+                case 'camera_top': handleCameraTop(msg.data); break;
+                case 'camera_bottom': handleCameraBottom(msg.data); break;
+                case 'battery': handleBattery(msg); break;
+                case 'robot_pose': handlePose(msg); break;
+                case 'map_data': handleMap(msg); break;
+                case 'local_costmap': handleLocalCostmap(msg); break;
+                case 'global_costmap': handleGlobalCostmap(msg); break;
+                case 'scan_data': handleScan(msg); break;
+                case 'path_data': handlePath(msg); break;
+                case 'map_goals': handleGoals(msg); break;
+                case 'nav2_status': handleNav2Status(msg); break;
+                case 'ros_log': handleRosLog(msg); break;
+                case 'terminal_output': handleTerminalOutput(msg); break;
+                case 'pong': handlePong(msg); break;
+                default: console.warn('>>> [DISPATCH] Unknown msg type:', msg.type);
+            }
+        }
+
+        const showNotification = (msg, color = '#00ff44') => {
+            const container = document.getElementById('toast-container');
+            if (!container) return;
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            toast.style.borderLeftColor = color;
+            toast.innerHTML = `<span style="color:${color}">[SYSTEM]</span> ${msg}`;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                setTimeout(() => toast.remove(), 500);
+            }, 5000);
+        };
+
+        const logEntry = (p, t, c) => {
+            const l = document.createElement('div');
+            l.style.padding = '2px 0';
+            l.innerHTML = `<span style="color:#666">[${new Date().toLocaleTimeString()}]</span> <span style="color:${c}">${t}</span>`;
+            p.appendChild(l);
+            p.scrollTop = p.scrollHeight;
+            if (p.childNodes.length > 200) p.removeChild(p.firstChild);
+        };
+
         // ═══════════════════════════════════════════════════════════════
         // DOM-READY — wires up everything after HTML is parsed
         // ═══════════════════════════════════════════════════════════════
         document.addEventListener('DOMContentLoaded', () => {
-            const link = new RobotLink();
+            console.log(">>> [INIT] DOM_READY. Initializing Dashboard...");
+            try {
+                if (typeof Peer === 'undefined') {
+                    throw new Error("PeerJS Library not loaded! Check your internet connection or script tag.");
+                }
+                link = new RobotLink();
+            } catch (e) {
+                console.error(">>> [INIT] CRITICAL_FAILURE:", e);
+                alert("CRITICAL_INIT_FAILURE: " + e.message);
+                return;
+            }
 
-            // ── Connect Overlay (shown on load, hides on connect) ─────
+            // ── Connect Overlay ─────
             document.getElementById('btn-connect').onclick = () => {
                 const robotId = document.getElementById('input-robot-id').value.trim();
                 if (!robotId) { alert('Please enter the Robot Peer ID'); return; }
                 localStorage.setItem('lastRobotId', robotId);
                 link.connect(robotId);
             };
-            // Pre-fill last used ID
             const lastId = localStorage.getItem('lastRobotId');
             if (lastId) document.getElementById('input-robot-id').value = lastId;
 
-            // Allow Enter key in ID field
             document.getElementById('input-robot-id').onkeydown = (e) => {
                 if (e.key === 'Enter') document.getElementById('btn-connect').click();
             };
 
-            // Disconnect button inside overlay (if already shown)
             document.getElementById('btn-disconnect').onclick = () => {
                 link.disconnect();
                 document.getElementById('connect-overlay').style.display = 'flex';
                 showNotification('>>> MANUALLY_DISCONNECTED', '#ffaa00');
             };
 
-            let lastMsgTime = Date.now();
-
             // BROWSER NETWORK DETECTION
             window.addEventListener('online', () => {
                 showNotification('>>> NETWORK_RESTORED: RECOVERING_LINK...', '#00ff44');
                 if (link.robotId) link.connect(link.robotId);
             });
-
             window.addEventListener('offline', () => {
                 showNotification('>>> NETWORK_LOST: WAITING_FOR_ROVER...', '#ffaa00');
             });
 
-            // UNCONDITIONAL WATCHDOG — silent reconnect, no page reload
+            // WATCHDOG
             setInterval(() => {
-                if (!link.conn || !link.conn.open) return; // not connected, skip
+                if (!link.conn || !link.conn.open) return;
                 const idleTime = Date.now() - lastMsgTime;
                 if (idleTime > 15000) {
-                    console.warn(`>>> [WATCHDOG] IDLE_TIMEOUT: ${idleTime}ms. RECONNECTING...`);
                     showNotification('>>> LINK_STALE: RECONNECTING...', '#ff0000');
                     if (link.robotId) link.connect(link.robotId);
-                } else if (idleTime > 10000) {
-                    console.warn(">>> [WATCHDOG] LINK_STALE_DETECTED...");
-                    showNotification('>>> LINK_WARNING: SIGNAL_WEAK', '#ffaa00');
                 }
             }, 3000);
 
-            // --- Notification System ---
-            const toastContainer = document.getElementById('toast-container');
-            function showNotification(msg, color) {
-                const toast = document.createElement('div');
-                toast.className = 'toast';
-                toast.style.borderColor = color;
-                toast.style.boxShadow = `0 0 15px ${color}`;
-                toast.textContent = msg;
-                toastContainer.appendChild(toast);
-                setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 500); }, 3500);
-            }
-
-            // ── Message Dispatcher — replaces all socket.on() calls ──
-            function dispatch(msg) {
-                switch (msg.type) {
-                    case 'camera_top':      handleCameraTop(msg.data); break;
-                    case 'camera_bottom':   handleCameraBottom(msg.data); break;
-                    case 'battery':         handleBattery(msg); break;
-                    case 'robot_pose':      handlePose(msg); break;
-                    case 'map_data':        handleMap(msg); break;
-                    case 'local_costmap':   handleLocalCostmap(msg); break;
-                    case 'global_costmap':  handleGlobalCostmap(msg); break;
-                    case 'scan_data':       handleScan(msg); break;
-                    case 'path_data':       handlePath(msg); break;
-                    case 'map_goals':       handleGoals(msg); break;
-                    case 'nav2_status':     handleNav2Status(msg); break;
-                    case 'ros_log':         handleRosLog(msg); break;
-                    case 'terminal_output': handleTerminalOutput(msg); break;
-                    case 'pong':            handlePong(msg); break;
-                    default: console.warn('>>> [DISPATCH] Unknown msg type:', msg.type);
-                }
-            }
-
-            // --- Dual Camera Video (RAF-based, no overlapping redraws) ---
+            // CAMERA LOOP (RAF)
             const camTop = document.getElementById('camera_top'), ctxTop = camTop.getContext('2d'), imgTop = new Image();
             const camBottom = document.getElementById('camera_bottom'), ctxBottom = camBottom.getContext('2d'), imgBottom = new Image();
-            let topLastFrame = 0, bottomLastFrame = 0;
+            imgTop.onload = () => { camTop.width = imgTop.width; camTop.height = imgTop.height; ctxTop.drawImage(imgTop, 0, 0); };
+            imgBottom.onload = () => { camBottom.width = imgBottom.width; camBottom.height = imgBottom.height; ctxBottom.drawImage(imgBottom, 0, 0); };
 
-            // ── CHANGED: frame queuing instead of direct src assignment ──
-            let topFramePending = null;
-            let bottomFramePending = null;
-
-            function handleCameraTop(data) {
-                topFramePending = data;
-                topLastFrame = Date.now();
-            }
-
-            function handleCameraBottom(data) {
-                bottomFramePending = data;
-                bottomLastFrame = Date.now();
-            }
-
-            // onload handlers stay the same — draw to canvas when image decodes
-            imgTop.onload = () => {
-                camTop.width = imgTop.width;
-                camTop.height = imgTop.height;
-                ctxTop.drawImage(imgTop, 0, 0);
-            };
-            imgBottom.onload = () => {
-                camBottom.width = imgBottom.width;
-                camBottom.height = imgBottom.height;
-                ctxBottom.drawImage(imgBottom, 0, 0);
-            };
-
-            // ── CHANGED: single RAF loop drains both queues each frame ──
             function cameraLoop() {
-                if (topFramePending) {
-                    imgTop.src = 'data:image/jpeg;base64,' + topFramePending;
-                    topFramePending = null;
-                }
-                if (bottomFramePending) {
-                    imgBottom.src = 'data:image/jpeg;base64,' + bottomFramePending;
-                    bottomFramePending = null;
-                }
+                if (topFramePending) { imgTop.src = 'data:image/jpeg;base64,' + topFramePending; topFramePending = null; }
+                if (bottomFramePending) { imgBottom.src = 'data:image/jpeg;base64,' + bottomFramePending; bottomFramePending = null; }
                 requestAnimationFrame(cameraLoop);
             }
-            requestAnimationFrame(cameraLoop);
-            // ── END CHANGE ──
+            cameraLoop();
 
+            // Status Panel
             setInterval(() => {
                 const now = Date.now();
-                const topStatus = document.getElementById('top-status'), bottomStatus = document.getElementById('bottom-status');
-                const topDot = document.getElementById('top-dot'), bottomDot = document.getElementById('bottom-dot');
+                const topStatus = document.getElementById('top-status'), topDot = document.getElementById('top-dot');
+                const bottomStatus = document.getElementById('bottom-status'), bottomDot = document.getElementById('bottom-dot');
+                if (!topStatus) return;
                 if (now - topLastFrame < 2500) {
                     topStatus.textContent = 'ONLINE'; topStatus.style.color = '#00ff44';
                     topDot.style.background = '#00ff44'; topDot.style.boxShadow = '0 0 8px #00ff44';
@@ -277,179 +490,34 @@
                 }
             }, 1000);
 
-            // --- Navigation State ---
+            // TELEOP
+            document.onkeydown = (e) => {
+                if (document.activeElement.tagName === 'INPUT') return;
+                const char = e.key.toUpperCase();
+                if (['W', 'A', 'S', 'D', 'X'].includes(char)) send(char);
+            };
+            document.onkeyup = (e) => {
+                if (document.activeElement.tagName === 'INPUT') return;
+                const char = e.key.toUpperCase();
+                if (['W', 'A', 'S', 'D', 'X'].includes(char)) stopKey(char);
+            };
+
+            const send = (c) => {
+                link.send('cmd_vel', { command: c });
+                const vkey = document.getElementById(`vkey-${c}`);
+                if (vkey) vkey.classList.add('active');
+            };
+            const stopKey = (c) => {
+                link.send('cmd_vel', { command: c === 'X' ? 'X' : 'RELEASE_' + c });
+                const vkey = document.getElementById(`vkey-${c}`);
+                if (vkey) vkey.classList.remove('active');
+            };
+
+            // MODALS & TOOLS
             const radarCanvas = document.getElementById('radar-canvas'), modalCanvas = document.getElementById('modal-canvas');
-            const rctx = radarCanvas.getContext('2d'), mctx = modalCanvas.getContext('2d');
+            mapImg.onload = renderHud; localCostImg.onload = renderHud; globalCostImg.onload = renderHud;
 
-            let mapImg = new Image(), localCostImg = new Image(), globalCostImg = new Image();
-            let mapData = null, localCostData = null, globalCostData = null;
-            let robotPose = { x: 0, y: 0, yaw: 0 }, pathPoints = [], scanPoints = [];
-            let isModalOpen = false, followRobot = true;
-
-            let zoom = 1.0, panX = 0, panY = 0, isDragging = false, lastMouseX = 0, lastMouseY = 0;
-            let rZoom = 0.8, rPanX = 0, rPanY = 0, rIsDragging = false, rLastX = 0, rLastY = 0;
-
-            let currentGoals = [];
-
-            mapImg.onload = renderHud;
-            localCostImg.onload = renderHud;
-            globalCostImg.onload = renderHud;
-
-            function handleMap(d)         { mapData = d;        mapImg.src        = 'data:image/png;base64,' + d.image; }
-            function handleLocalCostmap(d) { localCostData = d;  localCostImg.src  = 'data:image/png;base64,' + d.image; renderHud(); }
-            function handleGlobalCostmap(d){ globalCostData = d; globalCostImg.src = 'data:image/png;base64,' + d.image; renderHud(); }
-            function handleScan(d)         { scanPoints = d.points; renderHud(); }
-            function handlePath(d)         { pathPoints = d.path; renderHud(); }
-
-            function handlePose(d) {
-                robotPose = d;
-                if (d.stamp) {
-                    const latency = (Date.now() / 1000 - d.stamp).toFixed(2);
-                    const syncIndicator = document.getElementById('sync-indicator');
-                    const syncLatency = document.getElementById('sync-latency');
-                    if (syncIndicator) {
-                        syncIndicator.style.background = '#00ff44';
-                        setTimeout(() => syncIndicator.style.background = 'transparent', 100);
-                    }
-                    if (syncLatency) {
-                        syncLatency.textContent = `LAG: ${latency}s`;
-                        syncLatency.style.color = latency > 1.0 ? '#ff0000' : '#00e5ff';
-                    }
-                }
-                renderHud();
-            }
-
-
-            function handleGoals(data) {
-                console.log(">>> [GOAL_SYNC] Received mission goals:", data);
-                currentGoals = data.goals;
-                const container = document.getElementById('goal-list');
-                if (!container) return;
-
-                container.innerHTML = '';
-                if (currentGoals.length === 0) {
-                    container.innerHTML = '<div style="color:#666; padding:10px; font-size:0.8em;">NO_GOALS_LOADED</div>';
-                    return;
-                }
-
-                currentGoals.forEach(goal => {
-                    const btn = document.createElement('button');
-                    btn.className = 'goal-btn';
-                    btn.innerHTML = `<span class="goal-icon">📍</span> ${goal.name}`;
-                    btn.onclick = () => {
-                        if (confirm(`INITIATE TRAJECTORY TO [${goal.name}]?`)) {
-                            link.send('send_goal', goal);
-                            showNotification(`>>> MISSION_START: GOAL=[${goal.name}]`, '#00ff44');
-                        }
-                    };
-                    container.appendChild(btn);
-                });
-            }
-
-            function renderHud() {
-                try {
-                    draw(radarCanvas, rctx, { zoom: rZoom, panX: rPanX, panY: rPanY, follow: true });
-                    if (isModalOpen) draw(modalCanvas, mctx, { zoom: zoom, panX: panX, panY: panY, follow: followRobot });
-                } catch (e) { console.error(">>> [RENDER_HUD_ERROR]", e); }
-            }
-
-            function draw(target, tctx, view) {
-                const cw = target.width, ch = target.height;
-                tctx.clearRect(0, 0, cw, ch);
-                if (!mapData) {
-                    tctx.fillStyle = "#050a15"; tctx.fillRect(0, 0, cw, ch);
-                    tctx.fillStyle = "#00e5ff"; tctx.font = "bold 13px Fira Code"; tctx.textAlign = "center";
-                    tctx.fillText("ESTABLISHING_LINK...", cw / 2, ch / 2);
-                    return;
-                }
-                const res = mapData.resolution || 0.05;
-                const mapMaxY = mapData.origin_y + mapData.height * res;
-                const toPix = (wx, wy) => ({ x: (wx - mapData.origin_x) / res, y: (mapMaxY - wy) / res });
-                const rPix = toPix(robotPose.x, robotPose.y);
-
-                tctx.save();
-                try {
-                    tctx.translate(cw / 2 + view.panX, ch / 2 + view.panY);
-                    tctx.scale(view.zoom, view.zoom);
-                    if (view.follow) tctx.rotate(robotPose.yaw - Math.PI / 2);
-                    tctx.translate(-rPix.x, -rPix.y);
-
-                    tctx.beginPath(); tctx.strokeStyle = "rgba(0, 229, 255, 0.12)"; tctx.lineWidth = 1;
-                    for (let x = -100; x <= 100; x += 10) { const p1 = toPix(x, -100), p2 = toPix(x, 100); tctx.moveTo(p1.x, p1.y); tctx.lineTo(p2.x, p2.y); }
-                    for (let y = -100; y <= 100; y += 10) { const p1 = toPix(-100, y), p2 = toPix(100, y); tctx.moveTo(p1.x, p1.y); tctx.lineTo(p2.x, p2.y); }
-                    tctx.stroke();
-
-                    if (mapImg.complete) { tctx.save(); tctx.globalAlpha = 0.85; tctx.drawImage(mapImg, 0, 0); tctx.restore(); }
-
-                    const drawCost = (d, img, alpha) => {
-                        if (d && img.complete) {
-                            try {
-                                const dr = d.resolution || 0.05;
-                                const cPix = toPix(d.origin_x, d.origin_y + d.height * dr);
-                                const dw = (d.width * dr) / res, dh = (d.height * dr) / res;
-                                tctx.save(); tctx.globalAlpha = alpha;
-                                if (d.yaw && Math.abs(d.yaw) > 0.001) {
-                                    const cOriginPix = toPix(d.origin_x, d.origin_y);
-                                    tctx.translate(cOriginPix.x, cOriginPix.y); tctx.rotate(-d.yaw); tctx.translate(-cOriginPix.x, -cOriginPix.y);
-                                }
-                                tctx.drawImage(img, cPix.x, cPix.y, dw, dh);
-                                tctx.restore();
-                            } catch (e) { }
-                        }
-                    };
-                    drawCost(globalCostData, globalCostImg, 0.4);
-                    drawCost(localCostData, localCostImg, 0.6);
-
-                    if (pathPoints.length > 2) {
-                        tctx.beginPath(); tctx.strokeStyle = "rgba(0, 255, 255, 1.0)"; tctx.lineWidth = 4 / view.zoom;
-                        const s = toPix(pathPoints[0].x, pathPoints[0].y); tctx.moveTo(s.x, s.y);
-                        pathPoints.forEach(p => { const pix = toPix(p.x, p.y); tctx.lineTo(pix.x, pix.y); });
-                        tctx.stroke();
-                    }
-
-                    if (scanPoints.length > 0) {
-                        tctx.fillStyle = "#ff2200";
-                        const cY = Math.cos(robotPose.yaw), sY = Math.sin(robotPose.yaw);
-                        scanPoints.forEach(p => {
-                            const wx = robotPose.x + p.x * cY - p.y * sY;
-                            const wy = robotPose.y + p.x * sY + p.y * cY;
-                            const pix = toPix(wx, wy);
-                            tctx.beginPath(); tctx.arc(pix.x, pix.y, 3 / view.zoom, 0, Math.PI * 2); tctx.fill();
-                        });
-                    }
-                } finally {
-                    tctx.restore();
-                }
-
-                tctx.save();
-                tctx.translate(cw / 2 + view.panX, ch / 2 + view.panY);
-                tctx.scale(view.zoom, view.zoom);
-                if (!view.follow) tctx.rotate(-robotPose.yaw + Math.PI / 2);
-                tctx.beginPath();
-                tctx.moveTo(0, -20); tctx.lineTo(-14, 12); tctx.lineTo(0, 6); tctx.lineTo(14, 12);
-                tctx.closePath();
-                tctx.fillStyle = "#fff"; tctx.strokeStyle = "#000"; tctx.lineWidth = 2;
-                tctx.fill(); tctx.stroke();
-                tctx.restore();
-            }
-
-            const getMapCoords = (clientX, clientY, canvas, view) => {
-                if (!mapData) return { x: 0, y: 0 };
-                const rect = canvas.getBoundingClientRect(), mx = clientX - rect.left, my = clientY - rect.top;
-                const cw = canvas.width, ch = canvas.height, res = mapData.resolution || 0.05;
-                let vx = (mx - (cw / 2 + view.panX)) / view.zoom, vy = (my - (ch / 2 + view.panY)) / view.zoom;
-                if (view.follow) {
-                    const ang = -(robotPose.yaw - Math.PI / 2), cA = Math.cos(ang), sA = Math.sin(ang);
-                    const nx = vx * cA - vy * sA; vy = vx * sA + vy * cA; vx = nx;
-                }
-                const rPix = { x: (robotPose.x - mapData.origin_x) / res, y: (mapData.origin_y + mapData.height * res - robotPose.y) / res };
-                return { x: (vx + rPix.x) * res + mapData.origin_x, y: (mapData.origin_y + mapData.height * res) - (vy + rPix.y) * res };
-            };
-
-            modalCanvas.onmousedown = (e) => {
-                isDragging = true; lastMouseX = e.clientX; lastMouseY = e.clientY; followRobot = false;
-                document.getElementById('follow-btn').classList.remove('active');
-            };
+            modalCanvas.onmousedown = (e) => { isDragging = true; lastMouseX = e.clientX; lastMouseY = e.clientY; followRobot = false; document.getElementById('follow-btn').classList.remove('active'); };
             window.addEventListener('mousemove', (e) => {
                 if (isDragging) { panX += e.clientX - lastMouseX; panY += e.clientY - lastMouseY; lastMouseX = e.clientX; lastMouseY = e.clientY; renderHud(); }
                 else if (rIsDragging) { rPanX += e.clientX - rLastX; rPanY += e.clientY - rLastY; rLastX = e.clientX; rLastY = e.clientY; renderHud(); }
@@ -465,142 +533,22 @@
                 panX = 0; panY = 0; zoom = 1.0; followRobot = true;
                 document.getElementById('follow-btn').classList.add('active'); renderHud();
             };
+            document.getElementById('follow-btn').onclick = () => { followRobot = !followRobot; document.getElementById('follow-btn').classList.toggle('active', followRobot); if (followRobot) { panX = 0; panY = 0; zoom = 1.0; } renderHud(); };
+            document.getElementById('refresh-map-btn').onclick = () => { link.send('request_map', {}); showNotification('REFRESHING_MAP...', '#ff00cc'); };
 
-            document.getElementById('follow-btn').onclick = () => {
-                followRobot = !followRobot;
-                document.getElementById('follow-btn').classList.toggle('active', followRobot);
-                if (followRobot) { panX = 0; panY = 0; zoom = 1.0; }
-                renderHud();
-            };
-            document.getElementById('refresh-map-btn').onclick = () => {
-                link.send('request_map', {});
-                showNotification('REFRESHING_TACTICAL_MAP...', '#ff00cc');
-            };
-
-            function handleNav2Status(d) {
-                const badge = document.getElementById('nav2-status-badge');
-                if (!badge) return;
-                badge.innerText = `Nav2 Health: ${d.status}`;
-                badge.style.borderColor = d.status === 'OK' ? '#00ff44' : '#ff0000';
-                badge.style.color = d.status === 'OK' ? '#00ff44' : '#ff0000';
-                badge.style.background = d.status === 'OK' ? 'rgba(0, 255, 68, 0.08)' : 'rgba(255, 0, 0, 0.1)';
-            }
-
-            const logEntry = (p, t, c) => {
-                const l = document.createElement('div');
-                l.style.padding = '2px 0';
-                l.innerHTML = `<span style="color:#666">[${new Date().toLocaleTimeString()}]</span> <span style="color:${c}">${t}</span>`;
-                p.appendChild(l);
-                p.scrollTop = p.scrollHeight;
-                if (p.childNodes.length > 200) p.removeChild(p.firstChild);
-            };
-
-            function handleRosLog(d) {
-                const p = document.getElementById('log-terminal');
-                const colors = { 'INFO': '#00ff44', 'WARN': '#ffaa00', 'ERROR': '#ff0000', 'FATAL': '#ff00cc' };
-                logEntry(p, `[${d.name}] ${d.msg}`, colors[d.level] || '#fff');
-            }
-
-            function handleTerminalOutput(d) {
-                const p = document.getElementById('shell-output');
-                const l = document.createElement('div');
-                l.textContent = d.data;
-                p.appendChild(l);
-                p.scrollTop = p.scrollHeight;
-            }
-
-            function handlePong(d) {
-                const rtt = Date.now() - (d.ts || link._rttTs);
-                const syncLatency = document.getElementById('sync-latency');
-                if (syncLatency) {
-                    syncLatency.textContent = `RTT: ${rtt}ms`;
-                    syncLatency.style.color = rtt > 500 ? '#ff0000' : rtt > 200 ? '#ffaa00' : '#00e5ff';
-                }
-                const syncIndicator = document.getElementById('sync-indicator');
-                if (syncIndicator) {
-                    syncIndicator.style.background = '#00ff44';
-                    setTimeout(() => syncIndicator.style.background = 'transparent', 100);
-                }
-            }
-
+            document.getElementById('view-shell-btn').onclick = () => { document.getElementById('shell-modal').style.display = 'flex'; setTimeout(() => document.getElementById('shell-input').focus(), 300); };
+            document.getElementById('view-logs-btn').onclick = () => { document.getElementById('log-modal').style.display = 'flex'; };
             document.getElementById('shell-input').onkeydown = (e) => {
                 if (e.key === 'Enter') {
                     const cmd = e.target.value.trim();
-                    if (cmd) {
-                        link.send('terminal_command', { command: cmd });
-                        e.target.value = '';
-                        const p = document.getElementById('shell-output');
-                        const l = document.createElement('div');
-                        l.style.color = '#00e5ff';
-                        l.textContent = `$ ${cmd}`;
-                        p.appendChild(l);
-                    }
+                    if (cmd) { link.send('terminal_command', { command: cmd }); e.target.value = ''; }
                 }
             };
+            document.querySelectorAll('.modal').forEach(m => { m.onclick = (e) => { if (e.target.className === 'modal') { isModalOpen = false; e.target.style.display = 'none'; } }; });
 
-            document.getElementById('shell-stop').onclick = () => link.send('terminal_command', { command: 'stop' });
-            document.getElementById('shell-clear').onclick = () => document.getElementById('shell-output').innerHTML = '';
-
-            document.getElementById('view-shell-btn').onclick = () => {
-                document.getElementById('shell-modal').style.display = 'flex';
-                setTimeout(() => document.getElementById('shell-input').focus(), 300);
-            };
-            document.getElementById('view-logs-btn').onclick = () => { document.getElementById('log-modal').style.display = 'flex'; };
-            document.querySelectorAll('.modal').forEach(m => {
-                m.onclick = (e) => { if (e.target.className === 'modal') { isModalOpen = false; e.target.style.display = 'none'; } };
-            });
-
-            function handleBattery(d) {
-                const pct = d.percentage, charging = d.charging, unplug = d.unplug_required;
-                const bBox = document.getElementById('batt-box'), bFill = document.getElementById('batt-fill'),
-                    bPct = document.getElementById('batt-pct'), cMsg = document.getElementById('charge-msg');
-                const hPctText = document.getElementById('hud-batt-pct');
-                bPct.textContent = pct + '%'; bFill.style.width = pct + '%'; hPctText.textContent = pct + '%';
-                if (charging) {
-                    bFill.style.background = '#00ffcc'; bPct.style.color = '#00ffcc';
-                    bBox.classList.add('pulse-charging'); bBox.classList.remove('pulse-low');
-                    cMsg.style.opacity = '1'; cMsg.textContent = unplug ? '!!! PLEASE UNPLUG CHARGER !!!' : 'ROBOT IS PLUGGED IN';
-                    if (unplug) cMsg.classList.add('urgent-blink'); else cMsg.classList.remove('urgent-blink');
-                } else {
-                    bBox.classList.remove('pulse-charging'); cMsg.classList.remove('urgent-blink');
-                    if (pct < 50) {
-                        bFill.style.background = '#ff0000'; bPct.style.color = '#ff4444'; cMsg.style.opacity = '1';
-                        if (pct < 30) { bBox.classList.add('pulse-low'); cMsg.textContent = '>>> CHARGE_NOW_CRITICAL'; }
-                        else { bBox.classList.remove('pulse-low'); cMsg.textContent = '>>> PLUG_IN_POWER'; }
-                    } else {
-                        bFill.style.background = '#00ff44'; bPct.style.color = '#00ff00';
-                        bBox.classList.remove('pulse-low'); cMsg.style.opacity = '0';
-                    }
-                }
-            }
-
-            const send = (c) => {
-                link.send('cmd_vel', { command: c });
-                const vkey = document.getElementById(`vkey-${c}`);
-                if (vkey) vkey.classList.add('active');
-            };
-            const stopKey = (c) => {
-                link.send('cmd_vel', { command: c === 'X' ? 'X' : 'RELEASE_' + c });
-                const vkey = document.getElementById(`vkey-${c}`);
-                if (vkey) vkey.classList.remove('active');
-            };
-
-            document.onkeydown = (e) => {
-                if (document.activeElement.tagName === 'INPUT') return;
-                const char = e.key.toUpperCase();
-                if (['W', 'A', 'S', 'D', 'X'].includes(char)) send(char);
-            };
-            document.onkeyup = (e) => {
-                if (document.activeElement.tagName === 'INPUT') return;
-                const char = e.key.toUpperCase();
-                if (['W', 'A', 'S', 'D', 'X'].includes(char)) stopKey(char);
-            };
-
-            // CLOCK TICK
             setInterval(() => {
-                const now = new Date();
-                const timeStr = now.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-                document.getElementById('sys-clock').textContent = timeStr;
+                const clock = document.getElementById('sys-clock');
+                if (clock) clock.textContent = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
             }, 500);
         });
     </script>
@@ -1342,8 +1290,15 @@
         }
 
         @keyframes coFadeIn {
-            from { opacity: 0; transform: translateY(-30px); }
-            to   { opacity: 1; transform: translateY(0); }
+            from {
+                opacity: 0;
+                transform: translateY(-30px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
 
         .co-title {
@@ -1435,15 +1390,14 @@
             <div class="co-title">📡 ROBOT_CORE_MONITOR</div>
             <div class="co-sub">PEER-TO-PEER SECURE LINK</div>
             <label class="co-label" for="input-robot-id">ROBOT PEER ID</label>
-            <input id="input-robot-id" class="co-input" type="text"
-                   placeholder="e.g. robot-petpooja-1" autocomplete="off" spellcheck="false">
+            <input id="input-robot-id" class="co-input" type="text" placeholder="e.g. robot-petpooja-1"
+                autocomplete="off" spellcheck="false">
             <button id="btn-connect" class="co-btn">ESTABLISH LINK</button>
             <div class="co-hint">Enter the Peer ID configured on your robot's Node.js bridge</div>
         </div>
     </div>
     <!-- ═══ DISCONNECT BUTTON (top-bar, always available) ════════════ -->
-    <button id="btn-disconnect" title="Disconnect from robot"
-            style="display:none; position:fixed; top:12px; right:12px; z-index:9999;
+    <button id="btn-disconnect" title="Disconnect from robot" style="display:none; position:fixed; top:12px; right:12px; z-index:9999;
                    background:transparent; border:1px solid #ff0044; color:#ff0044;
                    font-family:'Fira Code'; font-size:0.65em; padding:4px 12px; cursor:pointer;">
         DISCONNECT

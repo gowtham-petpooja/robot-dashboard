@@ -428,8 +428,8 @@ def start_ros2():
         executor = MultiThreadedExecutor(num_threads=12)
         nav_node = NavDataSubscriber(tf_buffer)
         nodes = [node, 
-                 ImageSubscriber('web_cam_top_sub', '/robot2/camera_top/camera_top/color/image_raw/compressed', 'camera_top_frame', 6),
-                 ImageSubscriber('web_cam_bottom_sub', '/robot2/camera_bottom/camera_bottom/color/image_raw/compressed', 'camera_bottom_frame', 6),
+                 ImageSubscriber('web_cam_top_sub', '/robot2/camera_top/camera_top/color/image_raw/compressed', 'camera_top', 6),
+                 ImageSubscriber('web_cam_bottom_sub', '/robot2/camera_bottom/camera_bottom/color/image_raw/compressed', 'camera_bottom', 6),
                  BatterySubscriber(), 
                  nav_node, 
                  LogSubscriber()]

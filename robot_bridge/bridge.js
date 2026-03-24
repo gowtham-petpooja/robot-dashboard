@@ -1,5 +1,43 @@
+const { JSDOM } = require('jsdom');
+const dom = new JSDOM('', {
+    url: 'http://localhost',
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
+});
+const { window } = dom;
+
+// --- Browser Globals for Node.js ---
+global.window = window;
+global.document = window.document;
+global.navigator = window.navigator;
+global.location = window.location;
+
+const wrtc = require('@roamhq/wrtc');
+const WS = require('ws');
+global.WebSocket = WS;
+window.WebSocket = WS; 
+
+// Mirror WebRTC to window & global for PeerJS
+const RTCPrototypes = [
+    { name: 'RTCPeerConnection', val: wrtc.RTCPeerConnection },
+    { name: 'RTCSessionDescription', val: wrtc.RTCSessionDescription },
+    { name: 'RTCIceCandidate', val: wrtc.RTCIceCandidate }
+];
+
+RTCPrototypes.forEach(({ name, val }) => {
+    window[name] = val;
+    global[name] = val;
+});
+
+// ── Stability Shims for webrtc-adapter ──
+// These bypass problematic shims that try to redefine non-configurable properties.
+wrtc.RTCIceCandidate.prototype.foundation = '';
+wrtc.RTCIceCandidate.prototype.relayProtocol = '';
+wrtc.RTCPeerConnection.prototype.connectionState = 'new';
+wrtc.RTCPeerConnection.prototype.sctp = null;
+
 const { Peer } = require('peerjs');
 const WebSocket = require('ws');
+
 
 // --- Configuration ---
 const ROBOT_PEER_ID = process.env.ROBOT_ID || 'robot-petpooja-1';
@@ -16,7 +54,8 @@ const peer = new Peer(ROBOT_PEER_ID, {
     host: '0.peerjs.com',
     port: 443,
     secure: true,
-    path: '/'
+    path: '/',
+    debug: 3 // Verbose logging
 });
 
 peer.on('open', (id) => {
