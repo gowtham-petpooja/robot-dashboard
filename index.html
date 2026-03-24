@@ -40,11 +40,19 @@
                 console.log(`>>> [PEER] Connecting to: ${robotId}`);
                 showNotification(`>>> ESTABLISHING_P2P_LINK to [${robotId}]...`, '#00e5ff');
 
-                this.peer = new Peer(undefined, {
+                this.peer = new Peer({
                     host: '0.peerjs.com',
                     port: 443,
                     secure: true,
-                    path: '/'
+                    path: '/',
+                    debug: 2,
+                    config: {
+                        'iceServers': [
+                            { url: 'stun:stun.l.google.com:19302' },
+                            { url: 'stun:stun1.l.google.com:19302' },
+                            { url: 'stun:stun2.l.google.com:19302' }
+                        ]
+                    }
                 });
 
                 this.peer.on('open', (myId) => {
@@ -419,7 +427,12 @@
             // ── Connect Overlay ─────
             document.getElementById('btn-connect').onclick = () => {
                 const robotId = document.getElementById('input-robot-id').value.trim();
+                const btn = document.getElementById('btn-connect');
                 if (!robotId) { alert('Please enter the Robot Peer ID'); return; }
+                
+                btn.disabled = true;
+                btn.innerHTML = '<div class="spinner"></div>CONNECTING...';
+                
                 localStorage.setItem('lastRobotId', robotId);
                 link.connect(robotId);
             };
@@ -429,6 +442,27 @@
             document.getElementById('input-robot-id').onkeydown = (e) => {
                 if (e.key === 'Enter') document.getElementById('btn-connect').click();
             };
+
+            link.on('open', () => {
+                const overlay = document.getElementById('overlay-link');
+                overlay.style.opacity = '0';
+                setTimeout(() => overlay.style.display = 'none', 500);
+                
+                const btn = document.getElementById('btn-connect');
+                btn.disabled = false;
+                btn.innerText = 'ESTABLISH_P2P_LINK';
+            });
+
+            link.on('disconnected', () => {
+                document.getElementById('overlay-link').style.display = 'flex';
+                document.getElementById('overlay-link').style.opacity = '1';
+                
+                const btn = document.getElementById('btn-connect');
+                btn.disabled = false;
+                btn.innerText = 'ESTABLISH_P2P_LINK';
+                
+                showNotification('>>> SYSTEM_OFFLINE: LINK_LOST', '#ff0000');
+            });
 
             document.getElementById('btn-disconnect').onclick = () => {
                 link.disconnect();
@@ -920,6 +954,33 @@
             bottom: 30px;
             left: 50%;
             transform: translateX(-50%);
+        }
+
+        .nav-btn:disabled {
+            background: #333 !important;
+            color: #666 !important;
+            cursor: not-allowed;
+            border-color: #444 !important;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid rgba(0,0,0,0.3);
+            border-radius: 50%;
+            border-top-color: #000;
+            animation: spin 0.8s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        #overlay-link {
+            transition: opacity 0.5s ease, visibility 0.5s;
         }
 
         .radar {

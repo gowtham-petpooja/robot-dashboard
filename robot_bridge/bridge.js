@@ -62,7 +62,14 @@ const peer = new Peer(ROBOT_PEER_ID, {
     port: 443,
     secure: true,
     path: '/',
-    debug: 2 
+    debug: 2,
+    config: {
+        'iceServers': [
+            { url: 'stun:stun.l.google.com:19302' },
+            { url: 'stun:stun1.l.google.com:19302' },
+            { url: 'stun:stun2.l.google.com:19302' }
+        ]
+    }
 });
 
 peer.on('open', (id) => {
@@ -70,13 +77,18 @@ peer.on('open', (id) => {
 });
 
 peer.on('connection', (conn) => {
-    console.log(`>>> [PEER] New DASHBOARD_LINK established: ${conn.peer}`);
-    browserConns.add(conn);
+    console.log(`>>> [PEER] Incoming connection request from ${conn.peer}`);
     
-    // Request full initial state for the new connection
-    if (pythonWs && pythonWs.readyState === WebSocket.OPEN) {
-        pythonWs.send(JSON.stringify({ type: 'request_map' }));
-    }
+    conn.on('open', () => {
+        console.log(`>>> [PEER] DASHBOARD_LINK established: ${conn.peer}`);
+        browserConns.add(conn);
+        
+        // Request full initial state for the new connection only after it is open
+        if (pythonWs && pythonWs.readyState === WebSocket.OPEN) {
+            console.log('>>> [BRIDGE] Requesting initial state for new client...');
+            pythonWs.send(JSON.stringify({ type: 'request_map' }));
+        }
+    });
 
     conn.on('data', (raw) => {
         try {
