@@ -68,7 +68,7 @@ class AsyncBridge:
         while self._running:
             try:
                 print(f">>> [IPC] Connecting to Node Bridge at {NODE_BRIDGE_URL}...")
-                async with websockets.connect(NODE_BRIDGE_URL) as websocket:
+                async with websockets.connect(NODE_BRIDGE_URL, max_size=10*1024*1024) as websocket:
                     print(">>> [IPC] Connected to Node Bridge")
                     self.ws = websocket
                     

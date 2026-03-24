@@ -118,7 +118,10 @@ peer.on('error', (err) => {
 // ═══════════════════════════════════════════════════════════════
 // WEBSOCKET IPC SETUP (Local Link to Python)
 // ═══════════════════════════════════════════════════════════════
-const wss = new WebSocket.Server({ port: IPC_PORT });
+const wss = new WebSocket.Server({ 
+    port: IPC_PORT,
+    maxPayload: 10 * 1024 * 1024 // 10MB
+});
 console.log(`>>> [IPC] Internal Server Listening: ${IPC_PORT}`);
 
 wss.on('connection', (ws) => {
