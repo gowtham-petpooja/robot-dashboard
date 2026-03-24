@@ -1,3 +1,4 @@
+require('dotenv').config();
 // ── Global Error Resilience ──
 process.on('uncaughtException', (err) => {
     console.error('>>> [CRITICAL] Uncaught Exception:', err.message);
@@ -49,11 +50,14 @@ const WebSocket = require('ws');
 const { createCanvas, Image } = require('canvas');
 
 // --- Configuration ---
-const ROBOT_PEER_ID = process.env.ROBOT_ID || 'robot-petpooja-1';
+const ROBOT_PEER_ID = process.env.ROBOT_ID || 'robot1';
+const ROBOT_PASSWORD = process.env.ROBOT_PASSWORD || ''; // Empty means NO AUTH REQUIRED (unsafe)
 const IPC_PORT = process.env.IPC_PORT || 8765;
 
 // --- State ---
 let browserConn = null; // DataChannel connection
+let isAuthenticated = false;
+let authTimeout = null;
 let activeCall = null;   // MediaStream call
 let pythonWs = null;    // Internal ROS2 link
 
@@ -172,37 +176,81 @@ peer.on('connection', (conn) => {
     // Graceful handover
     if (browserConn) {
         console.log('>>> [PEER] Replacing existing connection and call...');
-        if (activeCall) { try { activeCall.close(); } catch(e) {} }
+        if (activeCall) { try { activeCall.close(); } catch(e) {} activeCall = null; }
         const old = browserConn;
         browserConn = null;
         try { old.close(); } catch(e) {}
     }
     
     browserConn = conn;
-    console.log(`>>> [PEER] Connected to: ${conn.peer}`);
+    isAuthenticated = false; // Reset on new connection
 
-    // Initiate the MediaStream call automatically
-    console.log(`>>> [PEER] Initiating MediaStream call to: ${conn.peer}`);
-    activeCall = peer.call(conn.peer, stream);
+    // Close if not authenticated within 10s
+    if (ROBOT_PASSWORD) {
+        if (authTimeout) clearTimeout(authTimeout);
+        authTimeout = setTimeout(() => {
+            if (!isAuthenticated && browserConn === conn) {
+                console.warn('>>> [AUTH] Handshake TIMEOUT. Closing rogue connection.');
+                conn.send(JSON.stringify({ type: 'error', message: 'Auth Timeout' }));
+                conn.close();
+            }
+        }, 10000);
+    } else {
+        // PERMISSIVE MODE: If no password set in .env, auto-auth
+        isAuthenticated = true;
+    }
 
     conn.on('data', (raw) => {
         try {
-            const msg = JSON.parse(raw);
+            const msg = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            
+            // 1. Authentication Handshake
+            if (msg.type === 'auth') {
+                if (!ROBOT_PASSWORD || msg.password === ROBOT_PASSWORD) {
+                    console.log('>>> [AUTH] Handshake SUCCESS. Unlocking system.');
+                    isAuthenticated = true;
+                    if (authTimeout) clearTimeout(authTimeout);
+                    conn.send(JSON.stringify({ type: 'auth_ok' }));
+                    
+                    // Securely initiate MediaStream call ONLY after auth
+                    console.log(`>>> [PEER] Initiating MediaStream call to: ${conn.peer}`);
+                    activeCall = peer.call(conn.peer, stream);
+                } else {
+                    console.warn('>>> [AUTH] Handshake FAILED: Invalid Password');
+                    conn.send(JSON.stringify({ type: 'auth_fail', reason: 'invalid_password' }));
+                    setTimeout(() => conn.close(), 500);
+                }
+                return;
+            }
+
+            // 2. Security Gate
+            if (!isAuthenticated) {
+                console.warn('>>> [AUTH] Protocol Violated: Command received before Auth. Ignoring.');
+                return;
+            }
+
+            // 3. Regular Command Flow (Ping/Pong and ROS2 commands)
             if (msg.type === 'ping') {
                 conn.send(JSON.stringify({ type: 'pong', ts: msg.ts }));
                 return;
             }
 
             if (pythonWs && pythonWs.readyState === WebSocket.OPEN) {
-                pythonWs.send(raw);
+                pythonWs.send(JSON.stringify(msg));
             }
-        } catch (e) { }
+        } catch (e) {
+            console.error('>>> [PEER] Invalid Message Format:', e.message);
+        }
     });
 
     conn.on('close', () => {
         console.log(`>>> [PEER] Connection closed: ${conn.peer}`);
         if (activeCall) { try { activeCall.close(); } catch(e) {} activeCall = null; }
-        if (browserConn === conn) browserConn = null;
+        if (browserConn === conn) {
+            browserConn = null;
+            isAuthenticated = false;
+        }
+        if (authTimeout) { clearTimeout(authTimeout); authTimeout = null; }
     });
 
     conn.on('error', (err) => {

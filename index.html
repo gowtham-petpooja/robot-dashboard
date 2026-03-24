@@ -33,8 +33,9 @@
                 this._rttTs = 0;
             }
 
-            connect(robotId) {
-                this.robotId = robotId;
+        connect(robotId, password) {
+            this.robotId = robotId;
+            this.password = password;
                 document.body.classList.remove('reconnecting');
                 if (this.peer && !this.peer.destroyed) this.peer.destroy();
 
@@ -135,7 +136,7 @@
                     this.peer.destroy();
                     this.peer = null;
                 }
-                setTimeout(() => this.connect(localStorage.getItem('lastRobotId')), 500);
+                setTimeout(() => this.connect(this.robotId, this.password), 500);
             }
 
             _openConn(robotId) {
@@ -144,7 +145,9 @@
                 
                 // Track reconnection attempts to avoid loops
                 this.conn.on('open', () => {
-                    console.log('>>> [PEER] DataChannel OPEN');
+                    // Immediately send Auth Handshake
+                    this.send('auth', { password: this.password });
+                    
                     const btn = document.getElementById('btn-connect');
                     if (btn) {
                         btn.classList.remove('is-loading');
@@ -160,10 +163,36 @@
                 });
 
                 this.conn.on('data', (raw) => {
-                    lastMsgTime = Date.now();
                     try {
-                        const msg = JSON.parse(raw);
-                        dispatch(msg);
+                        const msg = typeof raw === 'string' ? JSON.parse(raw) : raw;
+
+                        if (msg.type === 'auth_ok') {
+                            console.log('>>> [AUTH] Handshake SUCCESS');
+                            showNotification('>>> ACCESS_GRANTED: CORE_LINK_OK', '#00ff44');
+                            document.getElementById('connect-overlay').style.display = 'none';
+                            document.body.classList.add('connected');
+                            document.body.classList.remove('reconnecting');
+                            return;
+                        }
+
+                        if (msg.type === 'auth_fail') {
+                            console.error('>>> [AUTH] Handshake FAILED');
+                            showNotification('>>> ACCESS_DENIED: INVALID_PASSWORD', '#ff0000');
+                            this.disconnect();
+                            return;
+                        }
+
+                        if (msg.type === 'error') {
+                            showNotification(`>>> ERROR: ${msg.message}`, '#ffaa00');
+                            return;
+                        }
+
+                        lastMsgTime = Date.now();
+                        if (msg.type === 'pong') {
+                            dispatch(msg);
+                        } else {
+                            dispatch(msg);
+                        }
                     } catch (e) { console.warn('>>> [PEER] bad JSON', e); }
                 });
 
@@ -503,13 +532,15 @@
             document.getElementById('btn-connect').onclick = (e) => {
                 const btn = e.target;
                 const robotId = document.getElementById('input-robot-id').value.trim();
+                const password = document.getElementById('input-robot-pass').value.trim();
+                
                 if (!robotId) { alert('Please enter the Robot Peer ID'); return; }
                 
                 btn.classList.add('is-loading');
                 btn.innerText = 'CONNECTING...';
                 
                 localStorage.setItem('lastRobotId', robotId);
-                link.connect(robotId);
+                link.connect(robotId, password);
             };
             const lastId = localStorage.getItem('lastRobotId');
             if (lastId) document.getElementById('input-robot-id').value = lastId;
@@ -1575,9 +1606,14 @@
             <div class="co-title">📡 ROBOT_CORE_MONITOR</div>
             <div class="co-sub">PEER-TO-PEER SECURE LINK</div>
             <label class="co-label" for="input-robot-id">ROBOT PEER ID</label>
-            <input id="input-robot-id" class="co-input" type="text" placeholder="e.g. robot-petpooja-1"
+            <input id="input-robot-id" class="co-input" type="text" placeholder="e.g. robot1"
                 autocomplete="off" spellcheck="false">
-            <button id="btn-connect" class="co-btn">ESTABLISH LINK</button>
+            
+            <label class="co-label" for="input-robot-pass" style="margin-top:15px;">ACCESS PASSWORD</label>
+            <input id="input-robot-pass" class="co-input" type="password" placeholder="••••••••"
+                autocomplete="off">
+            
+            <button id="btn-connect" class="co-btn" style="margin-top:25px;">ESTABLISH LINK</button>
             <div class="co-hint">Enter the Peer ID configured on your robot's Node.js bridge</div>
         </div>
     </div>
