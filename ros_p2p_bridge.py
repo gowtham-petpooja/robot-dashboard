@@ -254,41 +254,46 @@ class NavDataSubscriber(Node):
     # ── Map ──────────────────────────────────────────────────────────────
 
     def process_map(self, msg):
-        """Convert OccupancyGrid → JPEG base64. JPEG is ~5x faster than PNG."""
+        """Convert OccupancyGrid → JPEG base64 and return adjusted metadata."""
         width, height = msg.info.width, msg.info.height
+        resolution = float(msg.info.resolution)
         if width == 0 or height == 0:
-            return None
+            return None, 0, 0, 0.0
         data = np.array(msg.data, dtype=np.int8).reshape((height, width))
 
-        # Build a 3-channel BGR image (no alpha needed for base map)
-        img = np.full((height, width, 3), 180, dtype=np.uint8)  # unknown = grey
-        img[data == 0]   = [215, 215, 215]   # free  = light grey
-        img[data == 100] = [45,  45,  45]    # occupied = dark grey
+        # Build a 3-channel BGR image
+        img = np.full((height, width, 3), 180, dtype=np.uint8)
+        img[data == 0]   = [215, 215, 215]
+        img[data == 100] = [45,  45,  45]
 
         img = cv2.flip(img, 0)
 
-        # Downsample if map is large (keeps it under ~200px on the short side)
+        # Downsample if map is large
         h, w = img.shape[:2]
-        if h > 300 or w > 300:
-            scale = 300.0 / max(h, w)
-            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_NEAREST)
+        new_w, new_h = w, h
+        new_res = resolution
+        if h > 600 or w > 600:
+            scale = 600.0 / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            new_res = resolution / scale
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
         _, buffer = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        return base64.b64encode(buffer).decode('utf-8')
+        return base64.b64encode(buffer).decode('utf-8'), new_w, new_h, new_res
 
     def map_callback(self, msg):
         now = time.time()
-        # Throttle: re-encode map at most every 3 seconds (maps rarely change)
+        # Throttle: re-encode map at most every 3 seconds
         if hasattr(self, '_last_map_emit_time') and (now - self._last_map_emit_time < 3.0):
             return
 
-        img_b64 = self.process_map(msg)
+        img_b64, w, h, res = self.process_map(msg)
         if img_b64:
             self.last_map = {
                 'image':    img_b64,
-                'resolution': float(msg.info.resolution),
-                'width':    int(msg.info.width),
-                'height':   int(msg.info.height),
+                'resolution': res,
+                'width':    w,
+                'height':   h,
                 'origin_x': float(msg.info.origin.position.x),
                 'origin_y': float(msg.info.origin.position.y)
             }
@@ -380,8 +385,11 @@ class NavDataSubscriber(Node):
                 'yaw':   yaw,
                 'stamp': trans.header.stamp.sec + trans.header.stamp.nanosec * 1e-9
             })
-        except:
-            pass  # TF not ready — skip silently, don't spam zeros
+        except Exception as e:
+            if hasattr(self, '_last_tf_err_time') and (time.time() - self._last_tf_err_time < 5.0):
+                return
+            print(f">>> [DEBUG] Pose lookup fail: {e}")
+            self._last_tf_err_time = time.time()
 
 
 # ── Process Command Logic ───────────────────────────────────────────
