@@ -210,17 +210,39 @@ peer.on('connection', (conn) => {
     });
 });
 
+let reconnectDelay = 1000;
 peer.on('error', (err) => {
     if (err.type === 'network') {
-        console.error('>>> [PEER] Network Error (DNS/Server Offline). Will retry...');
+        console.error('>>> [PEER] Network Error. Retrying in', reconnectDelay / 1000, 's...');
+        setTimeout(() => {
+            if (peer.disconnected && !peer.destroyed) peer.reconnect();
+            reconnectDelay = Math.min(reconnectDelay * 2, 60000); // Backoff to 60s
+        }, reconnectDelay);
+    } else if (err.message && err.message.includes('429')) {
+        console.error('>>> [CRITICAL] Rate limited (429) by PeerJS. Cooling down 60s...');
+        setTimeout(() => { if (!peer.destroyed) peer.reconnect(); }, 60000);
     } else {
         console.error('>>> [PEER] Global Error:', err.type, err.message);
     }
 });
 
+peer.on('open', () => {
+    console.log('>>> [PEER] Registered on signaling server. ID:', ROBOT_PEER_ID);
+    reconnectDelay = 1000; // Reset backoff on success
+});
+
 peer.on('disconnected', () => {
     console.warn('>>> [PEER] Disconnected from signaling server. Reconnecting...');
     if (!peer.destroyed) peer.reconnect();
+});
+
+// Avoid crashing on unhandled PeerJS internal protocol errors
+process.on('uncaughtException', (err) => {
+    if (err.message.includes('429')) {
+        console.error('>>> [CRITICAL] Caught 429 RateLimit Exception. Waiting 60s...');
+    } else {
+        console.error('>>> [CRITICAL] Uncaught Exception:', err);
+    }
 });
 
 // ═══════════════════════════════════════════════════════════════
