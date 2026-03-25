@@ -9,6 +9,21 @@ process.on('unhandledRejection', (reason, p) => {
 });
 
 const { JSDOM } = require('jsdom');
+// ── Global Rate Limit Protection ──
+let wsRetryDelay = 1000;
+const MAX_RETRY_DELAY = 30000;
+
+function backoffRetry(fn) {
+    setTimeout(() => {
+        wsRetryDelay = Math.min(wsRetryDelay * 2, MAX_RETRY_DELAY);
+        fn();
+    }, wsRetryDelay);
+}
+
+function resetBackoff() {
+    wsRetryDelay = 1000;
+}
+
 const dom = new JSDOM('', {
     url: 'http://localhost',
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
@@ -114,8 +129,12 @@ function rgbaToI420(rgba, width, height) {
 
 let lastFrameLog = 0;
 function pushFrameToSource(source, base64Data, canvas, ctx, img) {
-    // GATE: Only decode if there is an active call
     if (!activeCall) return;
+
+    const now = Date.now();
+    if (!source.lastFrameTime) source.lastFrameTime = 0;
+    if (now - source.lastFrameTime < FRAME_INTERVAL) return;
+    source.lastFrameTime = now;
 
     img.onload = () => {
         const start = Date.now();
@@ -150,9 +169,9 @@ function pushFrameToSource(source, base64Data, canvas, ctx, img) {
 // PEERJS SETUP (P2P Link)
 // ═══════════════════════════════════════════════════════════════
 const peer = new Peer(ROBOT_PEER_ID, {
-    host: '0.peerjs.com',
-    port: 443,
-    secure: true,
+    host: 'localhost',
+    port: 9000,
+    secure: false,
     path: '/',
     debug: 2,
     config: {
@@ -165,12 +184,18 @@ const peer = new Peer(ROBOT_PEER_ID, {
 
 peer.on('open', (id) => {
     console.log(`>>> [PEER] Robot Online. ID: ${id}`);
+    resetBackoff();
 });
 
 // ── Security & Authentication ──
 const ROBOT_PASSWORD = process.env.ROBOT_PASSWORD || 'robot1';
 
 peer.on('connection', (conn) => {
+    if (browserConn && browserConn.open) {
+        console.warn(`>>> [PEER] Rejecting duplicate connection from ${conn.peer}`);
+        conn.close();
+        return;
+    }
     console.log(`>>> [PEER] Incoming connection request: ${conn.peer}`);
     
     // Auth Timeout (must auth within 2 seconds)
@@ -203,10 +228,10 @@ peer.on('connection', (conn) => {
                     }
                     
                     browserConn = conn;
-                    console.log(`>>> [PEER] Connected to: ${conn.peer}`); // Added this line back for clarity
                     console.log(`>>> [PEER] Initiating MediaStream call to: ${conn.peer}`);
                     activeCall = peer.call(conn.peer, stream);
                     conn.send(JSON.stringify({ type: 'auth_ok' }));
+                    resetBackoff();
                 } else {
                     console.error(`>>> [AUTH] Invalid password from ${conn.peer}.`);
                     conn.send(JSON.stringify({ type: 'auth_fail', error: 'Invalid password' }));
@@ -243,16 +268,38 @@ peer.on('connection', (conn) => {
 });
 
 peer.on('error', (err) => {
-    if (err.type === 'network') {
-        console.error('>>> [PEER] Network Error (DNS/Server Offline). Will retry...');
-    } else {
-        console.error('>>> [PEER] Global Error:', err.type, err.message);
+    console.error('>>> [PEER] Error:', err.type, err.message);
+
+    if (err.type === 'network' || err.type === 'server-error') {
+        console.warn('>>> [PEER] Applying backoff retry...');
+
+        backoffRetry(() => {
+            if (!peer.destroyed) {
+                try {
+                    peer.reconnect();
+                } catch (e) {
+                    console.error('>>> [PEER] Reconnect failed:', e.message);
+                }
+            }
+        });
     }
 });
 
+let peerReconnectLock = false;
+
 peer.on('disconnected', () => {
-    console.warn('>>> [PEER] Disconnected from signaling server. Reconnecting...');
-    if (!peer.destroyed) peer.reconnect();
+    console.warn('>>> [PEER] Disconnected. Scheduling reconnect...');
+
+    if (peerReconnectLock) return;
+    peerReconnectLock = true;
+
+    backoffRetry(() => {
+        if (!peer.destroyed) {
+            console.log('>>> [PEER] Reconnecting...');
+            peer.reconnect();
+        }
+        peerReconnectLock = false;
+    });
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -287,7 +334,7 @@ wss.on('connection', (ws) => {
         }
 
         // 2. DataChannel Relay (Backup & Telemetry)
-        if (browserConn && browserConn.open) {
+        if (browserConn && browserConn.open && browserConn.dataChannel) {
             const dc = browserConn.dataChannel;
             // Only send if the raw DataChannel is actually in the 'open' state
             if (!dc || dc.readyState !== 'open') return;
