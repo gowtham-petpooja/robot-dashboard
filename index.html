@@ -29,12 +29,16 @@
                 this.peer = null;
                 this.conn = null;
                 this.robotId = null;
+                this.password = null;
+                this.authenticated = false;
                 this._hbTimer = null;
                 this._rttTs = 0;
             }
 
-            connect(robotId) {
+            connect(robotId, password) {
                 this.robotId = robotId;
+                this.password = password;
+                this.authenticated = false;
                 document.body.classList.remove('reconnecting');
                 if (this.peer && !this.peer.destroyed) this.peer.destroy();
 
@@ -60,7 +64,7 @@
                     call.on('stream', (remoteStream) => {
                         console.log('>>> [PEER] MediaStream RECEIVED. Routing tracks...');
                         const tracks = remoteStream.getVideoTracks();
-
+                        
                         if (tracks[0]) {
                             const vTop = document.getElementById('stream_top');
                             vTop.srcObject = new MediaStream([tracks[0]]);
@@ -75,7 +79,7 @@
                                 showNotification('>>> TOP_FEED: STREAM_OK', '#00ff00');
                             };
                         }
-
+                        
                         if (tracks[1]) {
                             const vBottom = document.getElementById('stream_bottom');
                             vBottom.srcObject = new MediaStream([tracks[1]]);
@@ -105,25 +109,10 @@
                         btn.classList.remove('is-loading');
                         btn.innerText = 'ESTABLISH LINK';
                     }
-
-                    if (err.message && err.message.includes('429')) {
-                        showNotification('!!! RATE LIMIT: Waiting 60s...', '#ff0000');
-                        this._rateLimitCooldown = true;
-                        setTimeout(() => this._rateLimitCooldown = false, 60000);
-                        return;
-                    }
-
                     showNotification(`>>> PEER_ERROR: ${err.type}`, '#ff0000');
                     if (['peer-unavailable', 'network', 'server-error', 'socket-error'].includes(err.type)) {
-                        const delay = this._backoffDelay || 3000;
-                        this._backoffDelay = Math.min(delay * 2, 60000);
-                        console.warn(`>>> [RECOVERY] Retrying in ${delay / 1000}s...`);
-                        setTimeout(() => this._openConn(robotId), delay);
+                        setTimeout(() => this._openConn(robotId), 3000);
                     }
-                });
-
-                this.peer.on('open', (id) => {
-                    this._backoffDelay = 3000; // Reset backoff
                 });
 
                 this.peer.on('disconnected', () => {
@@ -142,46 +131,59 @@
             }
 
             reconnect() {
-                if (this._rateLimitCooldown) {
-                    console.warn('>>> [RECONNECT] Blocked by active rate-limit cooldown.');
-                    return;
-                }
                 console.warn('>>> [PEER] Aggressive RECONNECT triggered!');
                 document.body.classList.add('reconnecting');
                 this._stopHeartbeat();
-                if (this.conn) { try { this.conn.close(); } catch (_) { } this.conn = null; }
+                if (this.conn) { try { this.conn.close(); } catch(_) {} this.conn = null; }
                 if (this.peer && !this.peer.destroyed) {
                     this.peer.destroy();
                     this.peer = null;
                 }
-                setTimeout(() => this.connect(localStorage.getItem('lastRobotId')), 2000);
+                setTimeout(() => this.connect(localStorage.getItem('lastRobotId'), localStorage.getItem('lastRobotPass')), 500);
             }
 
             _openConn(robotId) {
                 if (this.conn) { try { this.conn.close(); } catch (_) { } }
                 this.conn = this.peer.connect(robotId, { reliable: false, serialization: 'raw' });
-
+                
                 // Track reconnection attempts to avoid loops
                 this.conn.on('open', () => {
-                    console.log('>>> [PEER] DataChannel OPEN');
-                    const btn = document.getElementById('btn-connect');
-                    if (btn) {
-                        btn.classList.remove('is-loading');
-                        btn.innerText = 'ESTABLISH LINK';
-                    }
-                    document.body.classList.add('connected');
-                    document.getElementById('connect-overlay').style.display = 'none';
-                    document.getElementById('btn-disconnect').style.display = 'block';
-                    showNotification('>>> SYSTEM_ONLINE: P2P_LINK_ESTABLISHED', '#00ff00');
-                    lastMsgTime = Date.now();
-                    this._startHeartbeat();
-                    this.send('request_map', {});
+                    console.log('>>> [PEER] DataChannel OPEN. Authenticating...');
+                    this.send('auth', { password: this.password });
                 });
 
                 this.conn.on('data', (raw) => {
                     lastMsgTime = Date.now();
                     try {
                         const msg = JSON.parse(raw);
+                        
+                        if (msg.type === 'auth_ok') {
+                            console.log('>>> [AUTH] Success! Link established.');
+                            this.authenticated = true;
+                            const btn = document.getElementById('btn-connect');
+                            if (btn) {
+                                btn.classList.remove('is-loading');
+                                btn.innerText = 'ESTABLISH LINK';
+                            }
+                            document.body.classList.add('connected');
+                            document.getElementById('connect-overlay').style.display = 'none';
+                            document.getElementById('btn-disconnect').style.display = 'block';
+                            showNotification('>>> SYSTEM_ONLINE: P2P_LINK_SECURE', '#00ff00');
+                            localStorage.setItem('lastRobotId', this.robotId);
+                            localStorage.setItem('lastRobotPass', this.password);
+                            
+                            this._startHeartbeat();
+                            this.send('request_map', {});
+                            return;
+                        }
+
+                        if (msg.type === 'auth_fail') {
+                            showNotification('>>> AUTH_FAILED: ' + msg.error, '#ff0000');
+                            this.disconnect();
+                            return;
+                        }
+
+                        if (!this.authenticated) return; // Drop messages until authenticated
                         dispatch(msg);
                     } catch (e) { console.warn('>>> [PEER] bad JSON', e); }
                 });
@@ -339,7 +341,7 @@
             if (rtt < 150) { el.style.color = '#00ff00'; ind.style.background = '#00ff00'; }
             else if (rtt < 400) { el.style.color = '#ffaa00'; ind.style.background = '#ffaa00'; }
             else { el.style.color = '#ff0000'; ind.style.background = '#ff0000'; }
-
+            
             ind.classList.remove('sync-pulse');
             void ind.offsetWidth;
             ind.classList.add('sync-pulse');
@@ -522,20 +524,25 @@
             document.getElementById('btn-connect').onclick = (e) => {
                 const btn = e.target;
                 const robotId = document.getElementById('input-robot-id').value.trim();
+                const robotPass = document.getElementById('input-robot-pass').value.trim();
                 if (!robotId) { alert('Please enter the Robot Peer ID'); return; }
-
+                if (!robotPass) { alert('Please enter the Password'); return; }
+                
                 btn.classList.add('is-loading');
                 btn.innerText = 'CONNECTING...';
-
-                localStorage.setItem('lastRobotId', robotId);
-                link.connect(robotId);
+                
+                link.connect(robotId, robotPass);
             };
             const lastId = localStorage.getItem('lastRobotId');
+            const lastPass = localStorage.getItem('lastRobotPass');
             if (lastId) document.getElementById('input-robot-id').value = lastId;
+            if (lastPass) document.getElementById('input-robot-pass').value = lastPass;
 
-            document.getElementById('input-robot-id').onkeydown = (e) => {
-                if (e.key === 'Enter') document.getElementById('btn-connect').click();
-            };
+            document.querySelectorAll('#input-robot-id, #input-robot-pass').forEach(el => {
+                el.onkeydown = (e) => {
+                    if (e.key === 'Enter') document.getElementById('btn-connect').click();
+                };
+            });
 
             document.getElementById('btn-disconnect').onclick = () => {
                 link.disconnect();
@@ -560,7 +567,7 @@
             // WATCHDOG
             setInterval(() => {
                 const idle = Date.now() - lastMsgTime;
-
+                
                 // If we are currently trying to connect, don't trigger another recovery
                 if (document.body.classList.contains('reconnecting')) return;
 
@@ -571,14 +578,14 @@
                     }
                     return;
                 }
-
+                
                 // Aggressive lag indicator
                 const latEl = document.getElementById('sync-latency');
                 if (idle > 3000) {
-                    latEl.innerText = `>>> STALE: ${(idle / 1000).toFixed(1)}s`;
+                    latEl.innerText = `>>> STALE: ${(idle/1000).toFixed(1)}s`;
                     latEl.style.color = '#ff0000';
                 } else if (idle > 1000) {
-                    latEl.innerText = `>>> LAG: ${(idle / 1000).toFixed(1)}s`;
+                    latEl.innerText = `>>> LAG: ${(idle/1000).toFixed(1)}s`;
                     latEl.style.color = '#ffaa00';
                 }
 
@@ -735,20 +742,9 @@
         }
 
         @keyframes estop-pulse {
-            0% {
-                transform: scale(1);
-                box-shadow: 0 0 5px rgba(255, 0, 0, 0.5);
-            }
-
-            50% {
-                transform: scale(1.05);
-                box-shadow: 0 0 20px rgba(255, 0, 0, 0.9);
-            }
-
-            100% {
-                transform: scale(1);
-                box-shadow: 0 0 5px rgba(255, 0, 0, 0.5);
-            }
+            0% { transform: scale(1); box-shadow: 0 0 5px rgba(255,0,0,0.5); }
+            50% { transform: scale(1.05); box-shadow: 0 0 20px rgba(255,0,0,0.9); }
+            100% { transform: scale(1); box-shadow: 0 0 5px rgba(255,0,0,0.5); }
         }
 
         body.connected .top-bar {
@@ -1583,9 +1579,7 @@
         }
 
         @keyframes co-spin {
-            to {
-                transform: rotate(360deg);
-            }
+            to { transform: rotate(360deg); }
         }
 
         .co-hint {
@@ -1609,8 +1603,13 @@
             <label class="co-label" for="input-robot-id">ROBOT PEER ID</label>
             <input id="input-robot-id" class="co-input" type="text" placeholder="e.g. robot-petpooja-1"
                 autocomplete="off" spellcheck="false">
-            <button id="btn-connect" class="co-btn">ESTABLISH LINK</button>
-            <div class="co-hint">Enter the Peer ID configured on your robot's Node.js bridge</div>
+            
+            <label class="co-label" for="input-robot-pass" style="margin-top:10px;">ROBOT PASSWORD</label>
+            <input id="input-robot-pass" class="co-input" type="password" placeholder="Enter password"
+                autocomplete="off" spellcheck="false">
+
+            <button id="btn-connect" class="co-btn" style="margin-top:20px;">ESTABLISH LINK</button>
+            <div class="co-hint">Enter the credentials configured on your robot's bridge</div>
         </div>
     </div>
     <div class="top-bar">
@@ -1635,7 +1634,7 @@
         <div class="sys-group">
             <button id="view-shell-btn" class="nav-btn btn-shell">REMOTE_SHELL</button>
             <button id="view-logs-btn" class="nav-btn">SYSTEM_LOGS</button>
-
+            
             <div id="batt-box" class="energy-box">
                 <div id="batt-fill" class="energy-fill"></div>
             </div>
@@ -1660,8 +1659,7 @@
                 <span>BOTTOM_FEED :: </span><span id="bottom-status" class="status-text">INIT...</span>
             </div>
             <canvas id="camera_bottom" class="cam-feed"></canvas>
-            <video id="stream_bottom" class="cam-feed" autoplay playsinline
-                style="display:none; background:#000;"></video>
+            <video id="stream_bottom" class="cam-feed" autoplay playsinline style="display:none; background:#000;"></video>
         </div>
     </div>
 

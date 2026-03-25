@@ -1,3 +1,4 @@
+require('dotenv').config();
 // ── Global Error Resilience ──
 process.on('uncaughtException', (err) => {
     console.error('>>> [CRITICAL] Uncaught Exception:', err.message);
@@ -166,28 +167,59 @@ peer.on('open', (id) => {
     console.log(`>>> [PEER] Robot Online. ID: ${id}`);
 });
 
+// ── Security & Authentication ──
+const ROBOT_PASSWORD = process.env.ROBOT_PASSWORD || 'robot1';
+
 peer.on('connection', (conn) => {
     console.log(`>>> [PEER] Incoming connection request: ${conn.peer}`);
     
-    // Graceful handover
-    if (browserConn) {
-        console.log('>>> [PEER] Replacing existing connection and call...');
-        if (activeCall) { try { activeCall.close(); } catch(e) {} }
-        const old = browserConn;
-        browserConn = null;
-        try { old.close(); } catch(e) {}
-    }
-    
-    browserConn = conn;
-    console.log(`>>> [PEER] Connected to: ${conn.peer}`);
-
-    // Initiate the MediaStream call automatically
-    console.log(`>>> [PEER] Initiating MediaStream call to: ${conn.peer}`);
-    activeCall = peer.call(conn.peer, stream);
+    // Auth Timeout (must auth within 2 seconds)
+    let authenticated = false;
+    const authTimer = setTimeout(() => {
+        if (!authenticated) {
+            console.warn(`>>> [AUTH] Connection timeout for ${conn.peer}. Closing.`);
+            conn.close();
+        }
+    }, 2000);
 
     conn.on('data', (raw) => {
         try {
             const msg = JSON.parse(raw);
+            
+            // Challenge Response
+            if (msg.type === 'auth') {
+                if (msg.password === ROBOT_PASSWORD) {
+                    console.log(`>>> [AUTH] Success for ${conn.peer}! Access granted.`);
+                    authenticated = true;
+                    clearTimeout(authTimer);
+                    
+                    // Graceful handover after auth
+                    if (browserConn && browserConn !== conn) {
+                        console.log('>>> [PEER] Replacing existing connection and call...');
+                        if (activeCall) { try { activeCall.close(); } catch(e) {} }
+                        const old = browserConn;
+                        browserConn = null;
+                        try { old.close(); } catch(e) {}
+                    }
+                    
+                    browserConn = conn;
+                    console.log(`>>> [PEER] Connected to: ${conn.peer}`); // Added this line back for clarity
+                    console.log(`>>> [PEER] Initiating MediaStream call to: ${conn.peer}`);
+                    activeCall = peer.call(conn.peer, stream);
+                    conn.send(JSON.stringify({ type: 'auth_ok' }));
+                } else {
+                    console.error(`>>> [AUTH] Invalid password from ${conn.peer}.`);
+                    conn.send(JSON.stringify({ type: 'auth_fail', error: 'Invalid password' }));
+                    setTimeout(() => conn.close(), 500);
+                }
+                return;
+            }
+
+            if (!authenticated) {
+                console.warn(`>>> [AUTH] Received data before auth from ${conn.peer}. Dropping.`);
+                return;
+            }
+
             if (msg.type === 'ping') {
                 conn.send(JSON.stringify({ type: 'pong', ts: msg.ts }));
                 return;
@@ -210,39 +242,17 @@ peer.on('connection', (conn) => {
     });
 });
 
-let reconnectDelay = 1000;
 peer.on('error', (err) => {
     if (err.type === 'network') {
-        console.error('>>> [PEER] Network Error. Retrying in', reconnectDelay / 1000, 's...');
-        setTimeout(() => {
-            if (peer.disconnected && !peer.destroyed) peer.reconnect();
-            reconnectDelay = Math.min(reconnectDelay * 2, 60000); // Backoff to 60s
-        }, reconnectDelay);
-    } else if (err.message && err.message.includes('429')) {
-        console.error('>>> [CRITICAL] Rate limited (429) by PeerJS. Cooling down 60s...');
-        setTimeout(() => { if (!peer.destroyed) peer.reconnect(); }, 60000);
+        console.error('>>> [PEER] Network Error (DNS/Server Offline). Will retry...');
     } else {
         console.error('>>> [PEER] Global Error:', err.type, err.message);
     }
 });
 
-peer.on('open', () => {
-    console.log('>>> [PEER] Registered on signaling server. ID:', ROBOT_PEER_ID);
-    reconnectDelay = 1000; // Reset backoff on success
-});
-
 peer.on('disconnected', () => {
     console.warn('>>> [PEER] Disconnected from signaling server. Reconnecting...');
     if (!peer.destroyed) peer.reconnect();
-});
-
-// Avoid crashing on unhandled PeerJS internal protocol errors
-process.on('uncaughtException', (err) => {
-    if (err.message.includes('429')) {
-        console.error('>>> [CRITICAL] Caught 429 RateLimit Exception. Waiting 60s...');
-    } else {
-        console.error('>>> [CRITICAL] Uncaught Exception:', err);
-    }
 });
 
 // ═══════════════════════════════════════════════════════════════
