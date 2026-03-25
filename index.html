@@ -31,25 +31,36 @@
                 this.robotId = null;
                 this.password = null;
                 this.authenticated = false;
+                this.signalMode = 'cloud'; 
                 this._hbTimer = null;
                 this._rttTs = 0;
             }
 
-            connect(robotId, password) {
+            connect(robotId, password, signalMode = 'cloud') {
                 this.robotId = robotId;
                 this.password = password;
+                this.signalMode = signalMode;
                 this.authenticated = false;
                 document.body.classList.remove('reconnecting');
                 if (this.peer && !this.peer.destroyed) this.peer.destroy();
 
-                console.log(`>>> [PEER] Connecting to: ${robotId}`);
-                showNotification(`>>> ESTABLISHING_P2P_LINK to [${robotId}]...`, '#00e5ff');
+                console.log(`>>> [PEER] Connecting to ${robotId} via ${signalMode}...`);
+                showNotification(`>>> ESTABLISHING_P2P_LINK [${signalMode.toUpperCase()}]...`, '#00e5ff');
 
-                this.peer = new Peer(undefined, {
+                const peerConfig = signalMode === 'local' ? {
                     host: '100.88.180.65',
                     port: 9000,
                     secure: false,
-                    path: '/',
+                    path: '/'
+                } : {
+                    host: '0.peerjs.com',
+                    port: 443,
+                    secure: true,
+                    path: '/'
+                };
+
+                this.peer = new Peer(undefined, {
+                    ...peerConfig,
                     config: {
                         iceServers: [
                             { urls: 'stun:stun.l.google.com:19302' },
@@ -139,7 +150,11 @@
                     this.peer.destroy();
                     this.peer = null;
                 }
-                setTimeout(() => this.connect(localStorage.getItem('lastRobotId'), localStorage.getItem('lastRobotPass')), 500);
+                setTimeout(() => this.connect(
+                    localStorage.getItem('lastRobotId'), 
+                    localStorage.getItem('lastRobotPass'),
+                    localStorage.getItem('lastSignalMode') || 'cloud'
+                ), 500);
             }
 
             _openConn(robotId) {
@@ -525,18 +540,33 @@
                 const btn = e.target;
                 const robotId = document.getElementById('input-robot-id').value.trim();
                 const robotPass = document.getElementById('input-robot-pass').value.trim();
+                const signalMode = document.getElementById('select-signal').value;
                 if (!robotId) { alert('Please enter the Robot Peer ID'); return; }
                 if (!robotPass) { alert('Please enter the Password'); return; }
                 
+                // Security Check: GitHub Pages (HTTPS) cannot use "Local" mode
+                if (window.location.protocol === 'https:' && signalMode === 'local') {
+                    alert('Mixed Content Block: GitHub Pages requires "CLOUD" signaling server. \nPlease use Cloud mode or host the dashboard locally for Tailscale.');
+                    return;
+                }
+
                 btn.classList.add('is-loading');
                 btn.innerText = 'CONNECTING...';
                 
-                link.connect(robotId, robotPass);
+                localStorage.setItem('lastSignalMode', signalMode);
+                link.connect(robotId, robotPass, signalMode);
             };
             const lastId = localStorage.getItem('lastRobotId');
             const lastPass = localStorage.getItem('lastRobotPass');
+            const lastMode = localStorage.getItem('lastSignalMode');
             if (lastId) document.getElementById('input-robot-id').value = lastId;
             if (lastPass) document.getElementById('input-robot-pass').value = lastPass;
+            if (lastMode) document.getElementById('select-signal').value = lastMode;
+            
+            // Auto-default to Cloud on HTTPS
+            if (window.location.protocol === 'https:') {
+                document.getElementById('select-signal').value = 'cloud';
+            }
 
             document.querySelectorAll('#input-robot-id, #input-robot-pass').forEach(el => {
                 el.onkeydown = (e) => {
@@ -1608,13 +1638,19 @@
             <input id="input-robot-pass" class="co-input" type="password" placeholder="Enter password"
                 autocomplete="off" spellcheck="false">
 
+            <label class="co-label" for="select-signal" style="margin-top:10px;">SIGNALING SERVER</label>
+            <select id="select-signal" class="co-input" style="background:#000; color:#00e5ff; height:32px;">
+                <option value="cloud">PEERJS CLOUD (SECURE)</option>
+                <option value="local">LOCAL SERVER (TAILSCALE)</option>
+            </select>
+
             <button id="btn-connect" class="co-btn" style="margin-top:20px;">ESTABLISH LINK</button>
-            <div class="co-hint">Enter the credentials configured on your robot's bridge</div>
+            <div class="co-hint">GitHub Pages requires "Cloud" mode for security. Use "Local" for Tailscale/Private nets.</div>
         </div>
     </div>
     <div class="top-bar">
         <div class="branding">
-            <img src="/static/petpooja_logo.png" class="logo-img">
+            <img src="static/petpooja_logo.png" class="logo-img">
             <span class="brand-name">
                 Robot Core Monitor
                 <span id="nav2-status-badge" class="nav2-badge">Nav2 Health: INIT...</span>

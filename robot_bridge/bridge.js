@@ -68,6 +68,11 @@ const { createCanvas, Image } = require('canvas');
 const ROBOT_PEER_ID = process.env.ROBOT_ID || 'robot-petpooja-1';
 const IPC_PORT = process.env.IPC_PORT || 8765;
 
+// Signaling Config (Cloud by default for GitHub Pages compatibility)
+const SIGNAL_HOST = process.env.PEER_SIGNAL_HOST || '0.peerjs.com';
+const SIGNAL_PORT = parseInt(process.env.PEER_SIGNAL_PORT) || 443;
+const SIGNAL_SECURE = process.env.PEER_SIGNAL_SECURE === 'true' || SIGNAL_PORT === 443;
+
 // --- State ---
 let browserConn = null; // DataChannel connection
 let activeCall = null;   // MediaStream call
@@ -169,9 +174,9 @@ function pushFrameToSource(source, base64Data, canvas, ctx, img) {
 // PEERJS SETUP (P2P Link)
 // ═══════════════════════════════════════════════════════════════
 const peer = new Peer(ROBOT_PEER_ID, {
-    host: 'localhost',
-    port: 9000,
-    secure: false,
+    host: SIGNAL_HOST,
+    port: SIGNAL_PORT,
+    secure: SIGNAL_SECURE,
     path: '/',
     debug: 2,
     config: {
