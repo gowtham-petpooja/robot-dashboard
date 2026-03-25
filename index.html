@@ -139,7 +139,10 @@
                     this.peer.destroy();
                     this.peer = null;
                 }
-                setTimeout(() => this.connect(localStorage.getItem('lastRobotId'), localStorage.getItem('lastRobotPass')), 500);
+                // COOL DOWN: Wait 10 seconds before hitting the signaling server again if we were just blocked
+                setTimeout(() => {
+                    this.connect(localStorage.getItem('lastRobotId'), localStorage.getItem('lastRobotPass'));
+                }, 10000);
             }
 
             _openConn(robotId) {
@@ -572,7 +575,7 @@
                 if (document.body.classList.contains('reconnecting')) return;
 
                 if (!link.conn || !link.conn.open) {
-                    if (idle > 15000) {
+                    if (idle > 30000) { // Increased to 30s to allow signaling server some breathing room
                         console.warn('>>> [WATCHDOG] Initial connection stall. Reconnecting...');
                         link.reconnect();
                     }
@@ -589,8 +592,8 @@
                     latEl.style.color = '#ffaa00';
                 }
 
-                // Only perform forced recovery if we haven't seen data for 15 seconds
-                if (idle > 15000) {
+                // Only perform forced recovery if we haven't seen data for 30 seconds
+                if (idle > 30000) {
                     console.warn(`>>> [WATCHDOG] Link timeout (${idle}ms). Forced recovery...`);
                     showNotification('>>> LINK_STALE: RECOVERING...', '#ff0000');
                     link.reconnect();
@@ -1614,7 +1617,7 @@
     </div>
     <div class="top-bar">
         <div class="branding">
-            <img src="/static/petpooja_logo.png" class="logo-img">
+            <img src="static/petpooja_logo.png" class="logo-img">
             <span class="brand-name">
                 Robot Core Monitor
                 <span id="nav2-status-badge" class="nav2-badge">Nav2 Health: INIT...</span>
