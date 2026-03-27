@@ -59,11 +59,11 @@ const ROBOT_PEER_ID = process.env.ROBOT_ID || 'robot-petpooja-1';
 const IPC_PORT = process.env.IPC_PORT || 8765;
 
 // --- State ---
-let browserConn = null; // DataChannel connection
-let activeCall = null;   // MediaStream call
-let pythonWs = null;    // Internal ROS2 link
+let browserConn = null;
+let activeCall = null;
+let pythonWs = null;
 
-// ── WebRTC Media Source ───
+// ── WebRTC Media Sources ──
 const topVideoSource = new wrtc.nonstandard.RTCVideoSource();
 const topTrack = topVideoSource.createTrack();
 const bottomVideoSource = new wrtc.nonstandard.RTCVideoSource();
@@ -71,17 +71,16 @@ const bottomTrack = bottomVideoSource.createTrack();
 
 const stream = new MediaStream([topTrack, bottomTrack]);
 
-// --- Camera 1 (TOP) Resources ---
+// --- Canvas Resources ---
 const topCanvas = createCanvas(640, 480);
 const topCtx = topCanvas.getContext('2d');
 const topImg = new Image();
 
-// --- Camera 2 (BOTTOM) Resources ---
 const bottomCanvas = createCanvas(640, 480);
 const bottomCtx = bottomCanvas.getContext('2d');
 const bottomImg = new Image();
 
-// ── Optimized Pixel Format Conversion ───
+// ── Pixel Format Conversion ──
 function rgbaToI420(rgba, width, height) {
     const sw = width >> 1;
     const sh = height >> 1;
@@ -131,10 +130,9 @@ function pushFrameToSource(source, base64Data, canvas, ctx, img) {
             data: res.data
         });
 
-        const end = Date.now();
         const now = Date.now();
         if (now - lastFrameLog > 5000) {
-            console.log(`>>> [PEER] Frame Pushed. Conv Time: ${end - start}ms | Res: ${res.width}x${res.height}`);
+            console.log(`>>> [PEER] Frame Pushed. Conv Time: ${Date.now() - start}ms | Res: ${res.width}x${res.height}`);
             lastFrameLog = now;
         }
     };
@@ -143,7 +141,7 @@ function pushFrameToSource(source, base64Data, canvas, ctx, img) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// PEERJS SETUP (P2P Link with Self-Healing)
+// PEERJS SETUP
 // ═══════════════════════════════════════════════════════════════
 const ROBOT_PASSWORD = process.env.ROBOT_PASSWORD || 'robot1';
 let reconnectAttempts = 0;
@@ -156,7 +154,7 @@ function initPeer() {
     }
 
     console.log(`>>> [PEER] Initializing P2P Link (Attempt ${reconnectAttempts + 1})...`);
-    
+
     peer = new Peer(ROBOT_PEER_ID, {
         host: '0.peerjs.com',
         port: 443,
@@ -173,7 +171,7 @@ function initPeer() {
 
     peer.on('open', (id) => {
         console.log(`>>> [PEER] Robot Online. ID: ${id}`);
-        reconnectAttempts = 0; 
+        reconnectAttempts = 0;
         if (reconnectTimer) {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
@@ -199,21 +197,59 @@ function initPeer() {
 
 function triggerReconnect() {
     if (reconnectTimer) return;
-    
+
     reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 60000);
-    console.warn(`>>> [PEER] Signaling issue. Retrying in ${delay / 1000}s...`);
-    
+    console.warn(`>>> [PEER] Signaling issue. Retrying in ${delay / 1000}s (attempt ${reconnectAttempts})...`);
+
     reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         initPeer();
     }, delay);
 }
 
+// ── ICE Health Watcher ──────────────────────────────────────────
+// Watches the media call's peer connection directly.
+// When the router changes, ICE candidates become stale and the call
+// dies silently — this detects it and clears activeCall immediately
+// so the robot is ready for a fresh call from the browser.
+function watchCallHealth(call) {
+    const pc = call.peerConnection;
+
+    pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        console.log(`>>> [ICE] Connection state: ${state}`);
+
+        if (state === 'failed' || state === 'disconnected') {
+            console.warn('>>> [ICE] Media path lost (router change or network drop). Closing stale call.');
+            try { call.close(); } catch (e) { }
+            activeCall = null;
+            // browserConn DataChannel may still be alive briefly —
+            // the browser will detect frozen video and reconnect,
+            // at which point handleIncomingConnection will issue a new call.
+        }
+    };
+
+    pc.onconnectionstatechange = () => {
+        const state = pc.connectionState;
+        console.log(`>>> [PEER] Connection state: ${state}`);
+        if (state === 'failed') {
+            console.warn('>>> [PEER] PeerConnection failed. Closing stale call.');
+            try { call.close(); } catch (e) { }
+            activeCall = null;
+        }
+    };
+
+    call.on('error', (err) => {
+        console.error('>>> [CALL] Media call error:', err.message || err);
+        try { call.close(); } catch (e) { }
+        activeCall = null;
+    });
+}
+
 function handleIncomingConnection(conn) {
     console.log(`>>> [PEER] Incoming connection request: ${conn.peer}`);
 
-    // Auth Timeout (must auth within 2 seconds)
     let authenticated = false;
     const authTimer = setTimeout(() => {
         if (!authenticated) {
@@ -226,17 +262,16 @@ function handleIncomingConnection(conn) {
         try {
             const msg = JSON.parse(raw);
 
-            // Challenge Response
             if (msg.type === 'auth') {
                 if (msg.password === ROBOT_PASSWORD) {
                     console.log(`>>> [AUTH] Success for ${conn.peer}! Access granted.`);
                     authenticated = true;
                     clearTimeout(authTimer);
 
-                    // Graceful handover after auth
+                    // Graceful handover
                     if (browserConn && browserConn !== conn) {
                         console.log('>>> [PEER] Replacing existing connection and call...');
-                        if (activeCall) { try { activeCall.close(); } catch (e) { } }
+                        if (activeCall) { try { activeCall.close(); } catch (e) { } activeCall = null; }
                         const old = browserConn;
                         browserConn = null;
                         try { old.close(); } catch (e) { }
@@ -246,6 +281,10 @@ function handleIncomingConnection(conn) {
                     console.log(`>>> [PEER] Connected to: ${conn.peer}`);
                     console.log(`>>> [PEER] Initiating MediaStream call to: ${conn.peer}`);
                     activeCall = peer.call(conn.peer, stream);
+
+                    // ── Attach ICE/connection health watcher ──
+                    watchCallHealth(activeCall);
+
                     conn.send(JSON.stringify({ type: 'auth_ok' }));
                 } else {
                     console.error(`>>> [AUTH] Invalid password from ${conn.peer}.`);
@@ -272,7 +311,7 @@ function handleIncomingConnection(conn) {
     });
 
     conn.on('close', () => {
-        console.log(`>>> [PEER] Connection closed: ${conn.peer}`);
+        console.log(`>>> [PEER] DataChannel closed: ${conn.peer}`);
         if (activeCall) { try { activeCall.close(); } catch (e) { } activeCall = null; }
         if (browserConn === conn) browserConn = null;
     });
@@ -282,11 +321,11 @@ function handleIncomingConnection(conn) {
     });
 }
 
-// Start the loop
+// Start PeerJS
 initPeer();
 
 // ═══════════════════════════════════════════════════════════════
-// WEBSOCKET IPC SETUP (Local Link to Python)
+// WEBSOCKET IPC (Local Link to Python)
 // ═══════════════════════════════════════════════════════════════
 const wss = new WebSocket.Server({ port: IPC_PORT });
 console.log(`>>> [IPC] Internal Server Listening: ${IPC_PORT}`);
@@ -298,7 +337,6 @@ wss.on('connection', (ws) => {
     ws.on('message', (message) => {
         const raw = message.toString();
 
-        // 1. MediaStream Relay (High performance)
         if (raw.includes('"camera_top"')) {
             try {
                 const msg = JSON.parse(raw);
@@ -315,7 +353,6 @@ wss.on('connection', (ws) => {
             if (Math.random() < 0.05) console.log('>>> [IPC] Telemetry relaying...');
         }
 
-        // 2. DataChannel Relay (Backup & Telemetry)
         if (browserConn && browserConn.open) {
             const dc = browserConn.dataChannel;
             if (!dc || dc.readyState !== 'open') return;
@@ -342,13 +379,13 @@ wss.on('connection', (ws) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// PROCESS LOGIC
+// SHUTDOWN
 // ═══════════════════════════════════════════════════════════════
 process.on('SIGINT', () => {
     console.log('>>> [BRIDGE] Shutting down...');
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    if (activeCall) activeCall.close();
-    if (browserConn) browserConn.close();
-    peer.destroy();
+    if (activeCall) try { activeCall.close(); } catch (e) { }
+    if (browserConn) try { browserConn.close(); } catch (e) { }
+    if (peer) peer.destroy();
     process.exit();
 });

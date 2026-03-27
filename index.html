@@ -28,6 +28,8 @@
             constructor() {
                 this.peer = null;
                 this.conn = null;
+                this.activeCall = null;       // ← track the media call
+                this.iceWatchdog = null;      // ← timer for ICE disconnected grace period
                 this.robotId = null;
                 this.password = null;
                 this.authenticated = false;
@@ -58,13 +60,16 @@
                     }
                 });
 
+                // ── Incoming MediaStream call from robot ──
                 this.peer.on('call', (call) => {
                     console.log('>>> [PEER] Incoming MediaStream CALL. Answering...');
-                    call.answer(); // Answer without local stream
+                    this.activeCall = call;
+                    call.answer();
+
                     call.on('stream', (remoteStream) => {
                         console.log('>>> [PEER] MediaStream RECEIVED. Routing tracks...');
                         const tracks = remoteStream.getVideoTracks();
-                        
+
                         if (tracks[0]) {
                             const vTop = document.getElementById('stream_top');
                             vTop.srcObject = new MediaStream([tracks[0]]);
@@ -79,7 +84,7 @@
                                 showNotification('>>> TOP_FEED: STREAM_OK', '#00ff00');
                             };
                         }
-                        
+
                         if (tracks[1]) {
                             const vBottom = document.getElementById('stream_bottom');
                             vBottom.srcObject = new MediaStream([tracks[1]]);
@@ -94,6 +99,66 @@
                                 showNotification('>>> BOTTOM_FEED: STREAM_OK', '#00ff00');
                             };
                         }
+
+                        // Cancel any pending ICE watchdog — stream is healthy
+                        if (this.iceWatchdog) { clearTimeout(this.iceWatchdog); this.iceWatchdog = null; }
+                    });
+
+                    // ── ICE Health Monitoring ──────────────────────────────
+                    // Fires within 1-2s of a router change or network drop.
+                    // Much faster and more reliable than a stall timer.
+                    call.peerConnection.oniceconnectionstatechange = () => {
+                        const state = call.peerConnection.iceConnectionState;
+                        console.log(`>>> [ICE] State: ${state}`);
+
+                        if (state === 'failed') {
+                            // Hard failure — reconnect immediately
+                            console.warn('>>> [ICE] Hard failure. Reconnecting now...');
+                            showNotification('>>> ICE_FAILED: RECOVERING_LINK...', '#ff0000');
+                            this._cleanupCall();
+                            this.reconnect();
+
+                        } else if (state === 'disconnected') {
+                            // Disconnected can be transient (brief blip) — wait 4s before acting
+                            console.warn('>>> [ICE] Disconnected. Waiting 4s before reconnecting...');
+                            showNotification('>>> ICE_DISCONNECTED: WAITING...', '#ffaa00');
+                            this.iceWatchdog = setTimeout(() => {
+                                const s = call.peerConnection.iceConnectionState;
+                                if (s === 'disconnected' || s === 'failed') {
+                                    console.warn('>>> [ICE] Still disconnected. Reconnecting...');
+                                    showNotification('>>> ICE_STALE: RECOVERING_LINK...', '#ff0000');
+                                    this._cleanupCall();
+                                    this.reconnect();
+                                }
+                            }, 4000);
+
+                        } else if (state === 'connected' || state === 'completed') {
+                            // Recovered on its own — cancel watchdog
+                            if (this.iceWatchdog) { clearTimeout(this.iceWatchdog); this.iceWatchdog = null; }
+                            console.log('>>> [ICE] Connection healthy.');
+                        }
+                    };
+
+                    call.peerConnection.onconnectionstatechange = () => {
+                        const state = call.peerConnection.connectionState;
+                        console.log(`>>> [PEER] PeerConnection state: ${state}`);
+                        if (state === 'failed') {
+                            console.warn('>>> [PEER] PeerConnection failed. Reconnecting...');
+                            showNotification('>>> PEERCONN_FAILED: RECOVERING...', '#ff0000');
+                            this._cleanupCall();
+                            this.reconnect();
+                        }
+                    };
+
+                    call.on('error', (err) => {
+                        console.error('>>> [CALL] Media call error:', err);
+                        this._cleanupCall();
+                        this.reconnect();
+                    });
+
+                    call.on('close', () => {
+                        console.log('>>> [CALL] Media call closed by remote.');
+                        this._cleanupCall();
                     });
                 });
 
@@ -120,26 +185,46 @@
                     if (!this.peer.destroyed) this.peer.reconnect();
                 });
 
-                // --- Network Resilience (Router switches, interface changes) ---
+                // Network interface change (WiFi → Ethernet, router switch)
                 if (navigator.connection) {
                     navigator.connection.onchange = () => {
-                        console.warn('>>> [BROWSER] Network Change Detected! Triggering recovery...');
+                        console.warn('>>> [BROWSER] Network interface changed. Triggering recovery...');
                         showNotification('>>> NETWORK_SWITCH: REBOOTING_LINK...', '#ffaa00');
+                        this._cleanupCall();
                         this.reconnect();
                     };
                 }
+            }
+
+            // ── Clean up stale media call ──────────────────────────────
+            // Clears video elements and the activeCall reference so the
+            // robot side can issue a fresh call after reconnect.
+            _cleanupCall() {
+                if (this.iceWatchdog) { clearTimeout(this.iceWatchdog); this.iceWatchdog = null; }
+                if (this.activeCall) {
+                    try { this.activeCall.close(); } catch (e) { }
+                    this.activeCall = null;
+                }
+                // Clear video so UI shows blank rather than a frozen last frame
+                const vTop = document.getElementById('stream_top');
+                const vBottom = document.getElementById('stream_bottom');
+                if (vTop) { vTop.srcObject = null; vTop.style.display = 'none'; }
+                if (vBottom) { vBottom.srcObject = null; vBottom.style.display = 'none'; }
+                document.getElementById('camera_top').style.display = '';
+                document.getElementById('camera_bottom').style.display = '';
             }
 
             reconnect() {
                 console.warn('>>> [PEER] Aggressive RECONNECT triggered!');
                 document.body.classList.add('reconnecting');
                 this._stopHeartbeat();
-                if (this.conn) { try { this.conn.close(); } catch(_) {} this.conn = null; }
+                this._cleanupCall();
+                if (this.conn) { try { this.conn.close(); } catch (_) { } this.conn = null; }
                 if (this.peer && !this.peer.destroyed) {
                     this.peer.destroy();
                     this.peer = null;
                 }
-                // COOL DOWN: Wait 10 seconds before hitting the signaling server again if we were just blocked
+                // Cool down before hitting signaling server again
                 setTimeout(() => {
                     this.connect(localStorage.getItem('lastRobotId'), localStorage.getItem('lastRobotPass'));
                 }, 10000);
@@ -148,8 +233,7 @@
             _openConn(robotId) {
                 if (this.conn) { try { this.conn.close(); } catch (_) { } }
                 this.conn = this.peer.connect(robotId, { reliable: false, serialization: 'raw' });
-                
-                // Track reconnection attempts to avoid loops
+
                 this.conn.on('open', () => {
                     console.log('>>> [PEER] DataChannel OPEN. Authenticating...');
                     this.send('auth', { password: this.password });
@@ -159,7 +243,7 @@
                     lastMsgTime = Date.now();
                     try {
                         const msg = JSON.parse(raw);
-                        
+
                         if (msg.type === 'auth_ok') {
                             console.log('>>> [AUTH] Success! Link established.');
                             this.authenticated = true;
@@ -174,7 +258,7 @@
                             showNotification('>>> SYSTEM_ONLINE: P2P_LINK_SECURE', '#00ff00');
                             localStorage.setItem('lastRobotId', this.robotId);
                             localStorage.setItem('lastRobotPass', this.password);
-                            
+
                             this._startHeartbeat();
                             this.send('request_map', {});
                             return;
@@ -186,7 +270,7 @@
                             return;
                         }
 
-                        if (!this.authenticated) return; // Drop messages until authenticated
+                        if (!this.authenticated) return;
                         dispatch(msg);
                     } catch (e) { console.warn('>>> [PEER] bad JSON', e); }
                 });
@@ -222,6 +306,7 @@
 
             disconnect() {
                 this._stopHeartbeat();
+                this._cleanupCall();
                 if (this.peer && !this.peer.destroyed) this.peer.destroy();
                 this.peer = null;
                 this.conn = null;
@@ -242,16 +327,12 @@
         }
 
 
-
-
         // ═══════════════════════════════════════════════════════════════
         // GLOBAL STATE & HANDLERS
         // ═══════════════════════════════════════════════════════════════
         let link;
         let lastMsgTime = Date.now();
         let topLastFrame = 0, bottomLastFrame = 0;
-
-
 
         // --- Navigation State ---
         let mapImg = new Image(), localCostImg = new Image(), globalCostImg = new Image();
@@ -263,7 +344,7 @@
         let currentGoals = [];
 
         // --- Topic Handlers ---
-        function handleMap(d) { mapData = d; mapImg.src = 'data:image/png;base64,' + d.image; }
+        function handleMap(d) { mapData = d; mapImg.src = 'data:image/jpeg;base64,' + d.image; }
         function handleLocalCostmap(d) { localCostData = d; localCostImg.src = 'data:image/png;base64,' + d.image; renderHud(); }
         function handleGlobalCostmap(d) { globalCostData = d; globalCostImg.src = 'data:image/png;base64,' + d.image; renderHud(); }
         function handleScan(d) { scanPoints = d.points; renderHud(); }
@@ -344,7 +425,7 @@
             if (rtt < 150) { el.style.color = '#00ff00'; ind.style.background = '#00ff00'; }
             else if (rtt < 400) { el.style.color = '#ffaa00'; ind.style.background = '#ffaa00'; }
             else { el.style.color = '#ff0000'; ind.style.background = '#ff0000'; }
-            
+
             ind.classList.remove('sync-pulse');
             void ind.offsetWidth;
             ind.classList.add('sync-pulse');
@@ -508,7 +589,7 @@
         };
 
         // ═══════════════════════════════════════════════════════════════
-        // DOM-READY — wires up everything after HTML is parsed
+        // DOM-READY
         // ═══════════════════════════════════════════════════════════════
         document.addEventListener('DOMContentLoaded', () => {
             console.log(">>> [INIT] DOM_READY. Initializing Dashboard...");
@@ -530,10 +611,10 @@
                 const robotPass = document.getElementById('input-robot-pass').value.trim();
                 if (!robotId) { alert('Please enter the Robot Peer ID'); return; }
                 if (!robotPass) { alert('Please enter the Password'); return; }
-                
+
                 btn.classList.add('is-loading');
                 btn.innerText = 'CONNECTING...';
-                
+
                 link.connect(robotId, robotPass);
             };
             const lastId = localStorage.getItem('lastRobotId');
@@ -558,41 +639,45 @@
                 showNotification('!!! EMERGENCY STOP ACTIVATED !!!', '#ff0000');
             };
 
-            // BROWSER NETWORK DETECTION
+            // ── Network change detection (router swap / OS-level) ──
+            // Fires when the OS reports the link is back after a dropout.
             window.addEventListener('online', () => {
+                console.log('>>> [NET] Network restored. Triggering reconnect...');
                 showNotification('>>> NETWORK_RESTORED: RECOVERING_LINK...', '#00ff44');
-                if (link.robotId) link.connect(link.robotId);
+                if (link && link.robotId) {
+                    link._cleanupCall();
+                    link.reconnect();
+                }
             });
             window.addEventListener('offline', () => {
-                showNotification('>>> NETWORK_LOST: WAITING_FOR_ROVER...', '#ffaa00');
+                console.log('>>> [NET] Network lost.');
+                showNotification('>>> NETWORK_LOST: WAITING_FOR_RECOVERY...', '#ffaa00');
+                if (link) link._cleanupCall();
             });
 
-            // WATCHDOG
+            // WATCHDOG — only fires if completely stalled for 30s
             setInterval(() => {
                 const idle = Date.now() - lastMsgTime;
-                
-                // If we are currently trying to connect, don't trigger another recovery
+
                 if (document.body.classList.contains('reconnecting')) return;
 
                 if (!link.conn || !link.conn.open) {
-                    if (idle > 30000) { // Increased to 30s to allow signaling server some breathing room
+                    if (idle > 30000) {
                         console.warn('>>> [WATCHDOG] Initial connection stall. Reconnecting...');
                         link.reconnect();
                     }
                     return;
                 }
-                
-                // Aggressive lag indicator
+
                 const latEl = document.getElementById('sync-latency');
                 if (idle > 3000) {
-                    latEl.innerText = `>>> STALE: ${(idle/1000).toFixed(1)}s`;
+                    latEl.innerText = `>>> STALE: ${(idle / 1000).toFixed(1)}s`;
                     latEl.style.color = '#ff0000';
                 } else if (idle > 1000) {
-                    latEl.innerText = `>>> LAG: ${(idle/1000).toFixed(1)}s`;
+                    latEl.innerText = `>>> LAG: ${(idle / 1000).toFixed(1)}s`;
                     latEl.style.color = '#ffaa00';
                 }
 
-                // Only perform forced recovery if we haven't seen data for 30 seconds
                 if (idle > 30000) {
                     console.warn(`>>> [WATCHDOG] Link timeout (${idle}ms). Forced recovery...`);
                     showNotification('>>> LINK_STALE: RECOVERING...', '#ff0000');
@@ -745,9 +830,20 @@
         }
 
         @keyframes estop-pulse {
-            0% { transform: scale(1); box-shadow: 0 0 5px rgba(255,0,0,0.5); }
-            50% { transform: scale(1.05); box-shadow: 0 0 20px rgba(255,0,0,0.9); }
-            100% { transform: scale(1); box-shadow: 0 0 5px rgba(255,0,0,0.5); }
+            0% {
+                transform: scale(1);
+                box-shadow: 0 0 5px rgba(255, 0, 0, 0.5);
+            }
+
+            50% {
+                transform: scale(1.05);
+                box-shadow: 0 0 20px rgba(255, 0, 0, 0.9);
+            }
+
+            100% {
+                transform: scale(1);
+                box-shadow: 0 0 5px rgba(255, 0, 0, 0.5);
+            }
         }
 
         body.connected .top-bar {
@@ -1152,7 +1248,6 @@
             pointer-events: none;
         }
 
-        /* --- VISUAL TELEOP HUD --- */
         .teleop-hud {
             position: absolute;
             bottom: 40px;
@@ -1346,8 +1441,7 @@
             content: "";
             position: absolute;
             inset: 0;
-            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%),
-                linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
             background-size: 100% 3px, 3px 100%;
             pointer-events: none;
         }
@@ -1453,7 +1547,6 @@
             font-size: 1.1em;
         }
 
-        /* ── Connection Overlay ────────────────────────────────────── */
         #connect-overlay {
             position: fixed;
             inset: 0;
@@ -1582,7 +1675,9 @@
         }
 
         @keyframes co-spin {
-            to { transform: rotate(360deg); }
+            to {
+                transform: rotate(360deg);
+            }
         }
 
         .co-hint {
@@ -1598,7 +1693,6 @@
 
 <body>
     <div id="toast-container"></div>
-    <!-- ═══ CONNECTION OVERLAY ════════════════════════════════════════ -->
     <div id="connect-overlay">
         <div class="co-panel">
             <div class="co-title">📡 ROBOT_CORE_MONITOR</div>
@@ -1606,11 +1700,9 @@
             <label class="co-label" for="input-robot-id">ROBOT PEER ID</label>
             <input id="input-robot-id" class="co-input" type="text" placeholder="e.g. robot-petpooja-1"
                 autocomplete="off" spellcheck="false">
-            
             <label class="co-label" for="input-robot-pass" style="margin-top:10px;">ROBOT PASSWORD</label>
             <input id="input-robot-pass" class="co-input" type="password" placeholder="Enter password"
                 autocomplete="off" spellcheck="false">
-
             <button id="btn-connect" class="co-btn" style="margin-top:20px;">ESTABLISH LINK</button>
             <div class="co-hint">Enter the credentials configured on your robot's bridge</div>
         </div>
@@ -1624,7 +1716,6 @@
             </span>
             <button id="btn-emergency" class="emergency-stop-btn highlight-pulse">EMERGENCY STOP</button>
         </div>
-
         <div class="sync-monitor">
             <div id="sys-clock">00:00:00</div>
             <div id="sync-indicator" class="sync-pulse" onclick="window.location.reload()" title="Force Reconnect">
@@ -1633,16 +1724,13 @@
             <button onclick="window.location.reload()" class="shell-btn"
                 style="padding:2px 8px; font-size:0.6em; border-color:#00e5ff; color:#00e5ff;">FORCE_REFRESH</button>
         </div>
-
         <div class="sys-group">
             <button id="view-shell-btn" class="nav-btn btn-shell">REMOTE_SHELL</button>
             <button id="view-logs-btn" class="nav-btn">SYSTEM_LOGS</button>
-            
             <div id="batt-box" class="energy-box">
                 <div id="batt-fill" class="energy-fill"></div>
             </div>
             <span id="batt-pct" class="batt-val">--%</span>
-
             <button id="btn-disconnect" class="disconnect-btn" style="display:none;">DISCONNECT</button>
         </div>
     </div>
@@ -1662,13 +1750,13 @@
                 <span>BOTTOM_FEED :: </span><span id="bottom-status" class="status-text">INIT...</span>
             </div>
             <canvas id="camera_bottom" class="cam-feed"></canvas>
-            <video id="stream_bottom" class="cam-feed" autoplay playsinline style="display:none; background:#000;"></video>
+            <video id="stream_bottom" class="cam-feed" autoplay playsinline
+                style="display:none; background:#000;"></video>
         </div>
     </div>
 
     <div class="overlay-layer">
         <div id="charge-msg" class="charge-hint">ROBOT IS PLUGGED IN</div>
-
         <div class="teleop-hud">
             <div class="key-row">
                 <div style="width:50px"></div>
@@ -1689,7 +1777,6 @@
                     [EMERGENCY_STOP]</div>
             </div>
         </div>
-
         <div class="control-hints">
             <span><span class="hint-key">W/A/S/D</span> TO DRIVE</span>
             <span><span class="hint-key">X</span> TO STOP</span>

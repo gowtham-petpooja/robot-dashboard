@@ -10,20 +10,14 @@ A decentralised, high-performance robot dashboard using PeerJS (WebRTC) for dire
 
 ## Quick Start
 
-### 1. Robot-Side Setup
-Navigate to the robot bridge and start the signaling node:
+### 1. Unified Startup
+From the root of the project, run:
 ```bash
-cd robot_bridge
-node bridge.js
+./startup.sh
 ```
+This script will launch both the Node.js signaling bridge and the Python ROS 2 bridge. It handles environment sourcing and process cleanup automatically.
 
-### 2. ROS 2 Bridge
-In a separate terminal with your ROS 2 environment sourced:
-```bash
-python3 ros_p2p_bridge.py
-```
-
-### 3. Operator Dashboard
+### 2. Operator Dashboard
 Open `index.html` in a modern browser.
 Enter the Robot Peer ID (default: `robot-petpooja-1`) and click **Establish Link**.
 
